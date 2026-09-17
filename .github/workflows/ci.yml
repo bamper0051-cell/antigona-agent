@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The C11 envelope check verifies ``source_commit`` against git history
+          # (tests/unit/test_validator_c11.py), so a shallow checkout cannot pass.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        run: |
+          pip install hatchling ruff mypy pydantic
+          pip install -e ".[dev,tui,voice]"
+      - name: Ruff
+        run: ruff check src/ tests/
+      - name: Architecture Guard
+        run: python3 scripts/arch_guard.py
+      - name: Mypy (strict)
+        run: mypy --strict src/antigona
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # B26-1 (release pipeline v14.1): pinned verification environment.
+      # The sanitized tests assert paths that Antigona DERIVES from
+      # antigona.core.paths.home_dir() and antigona.core.paths.project_root().
+      # The release sanitizer rewrote the development host-home literals in
+      # tests/** onto the single public home below (rule B25-HOME), and the
+      # project-root assertion expects a project root directly under that
+      # home, exactly like the documented pinned verification run. Pin the
+      # same environment here, or the run is environment-false (a foreign
+      # home), not product-false.
+      ANTIGONA_HOME_DIR: /opt/antigona-home
+      ANTIGONA_PROJECT_ROOT: /opt/antigona-home/antigona-public
+      ANTIGONA_CONVERSATION_DATASETS: /opt/antigona-home/antigona-public/datasets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The C11 envelope check verifies ``source_commit`` against git history
+          # (tests/unit/test_validator_c11.py), so a shallow checkout cannot pass.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install bubblewrap (autonomy sandbox)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Provision the pinned verification home (B26-2)
+        run: |
+          set -euo pipefail
+          # B39: the pinned home (/opt/antigona-home) lives OUTSIDE $HOME and is
+          # root-owned on a GitHub-hosted runner. Create it ONCE with the same
+          # privilege this job already uses for bubblewrap, then hand it to the
+          # runner user, so every later step stays unprivileged. Without this the
+          # step dies with EACCES ("mkdir: cannot create directory
+          # '/opt/antigona-home': Permission denied") on any clean runner --
+          # a host-local run passes only because the directory already exists.
+          sudo mkdir -p "$ANTIGONA_HOME_DIR"
+          sudo chown -R "$(id -u):$(id -g)" "$ANTIGONA_HOME_DIR"
+          # The sanitized tests assert paths under the home that
+          # antigona.core.paths.home_dir() derives, and several of them require
+          # the derived directories to EXIST: tests/unit/test_autonomy_contracts.py
+          # needs <home>/.config and <home>/.hermes/master_prompt, and
+          # tests/unit/test_cli_uptime_export.py exports under the owner state
+          # dir (antigona.core.paths.owner_dir() == <home>/.antigona). The
+          # canonical host home has them; a fresh CI home does not. The same
+          # layout is provisioned for the pinned home AND for the runner home,
+          # so both derive paths agree. Only empty directories and placeholder
+          # credential files are created; nothing is read from any host home
+          # and no secret is used.
+          for h in "$HOME" "$ANTIGONA_HOME_DIR"; do
+            mkdir -p "$h/.antigona" "$h/.config" "$h/.hermes/master_prompt" "$h/.gemini" "$h/.local/bin" "$h/.local/share/claude" "$h/.codex" "$h/.claude" "$h/.grok"
+            for f in .codex/auth.json .claude/.credentials.json .claude/settings.json .grok/auth.json; do
+              test -f "$h/$f" || echo '{}' > "$h/$f"
+            done
+            test -f "$h/.codex/config.toml" || echo "model = 'placeholder'" > "$h/.codex/config.toml"
+          done
+      - name: Materialize the pinned project root (B26-2)
+        run: |
+          set -euo pipefail
+          # The suite must run from a project root directly under the pinned
+          # home (the sanitized project-root assertion names that location),
+          # so the checked-out tree is materialized there before installing
+          # and running. Nothing else about the checkout changes.
+          rm -rf "$ANTIGONA_PROJECT_ROOT"
+          mkdir -p "$(dirname "$ANTIGONA_PROJECT_ROOT")"
+          cp -a "$GITHUB_WORKSPACE" "$ANTIGONA_PROJECT_ROOT"
+      - name: Install deps
+        working-directory: ${{ env.ANTIGONA_PROJECT_ROOT }}
+        run: |
+          pip install hatchling pytest pytest-asyncio httpx
+          pip install -e ".[dev,tui,voice]"
+      - name: Tests (full suite, soft RLIMIT_NOFILE=1024, no ANTIGONA_PIN)
+        working-directory: ${{ env.ANTIGONA_PROJECT_ROOT }}
+        run: |
+          ulimit -Sn 1024
+          unset ANTIGONA_PIN
+          pytest tests --tb=short -q 2>&1

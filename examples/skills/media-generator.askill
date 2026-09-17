@@ -1,0 +1,38 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def07
+%slug     media-generator
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Генерирует изображения по текстовому описанию.
+> Использует GENERATE_IMAGE инструмент для создания
+> визуального контента.
+
+[match] mode=any
+kw             изображение | картинка | image | generate | сгенерируй
+kw             нарисуй
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "docs/SKILL_FORMAT.md"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              media-generator-1
+steps             1
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:ac687fd9f5e7d83a815407e851855f5893c8aed14b10b6aeddf14b6c80fc4872 bytes=907

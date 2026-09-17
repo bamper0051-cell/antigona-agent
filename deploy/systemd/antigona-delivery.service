@@ -1,0 +1,58 @@
+[Unit]
+Description=Antigona Delivery Worker (Phase B.6 hardened preboot)
+After=network-online.target antigona-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=antigona-svc
+Group=antigona-svc
+EnvironmentFile=@ANTIGONA_ENV_FILE@
+Environment=HOME=/var/lib/antigona
+Environment=PYTHONPATH=@ANTIGONA_ROOT@/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TMPDIR=/run/antigona
+Environment=XDG_CACHE_HOME=/var/lib/antigona/cache
+Environment=XDG_CONFIG_HOME=/var/lib/antigona/config
+Environment=XDG_STATE_HOME=/var/lib/antigona/state
+Environment=ANTIGONA_DATABASE_URL=sqlite:////var/lib/antigona/antigona.db
+Environment=ANTIGONA_WORKSPACE=/var/lib/antigona/workspace
+Environment=ANTIGONA_SESSION_DB_PATH=/var/lib/antigona/antigona_sessions.db
+Environment=ANTIGONA_SECURITY_DIR=/var/lib/antigona/security
+Environment=ANTIGONA_OWNERSHIP_DIR=/var/lib/antigona/ownership
+Environment=ANTIGONA_AUDIT_DB_PATH=/var/lib/antigona/audit.db
+Environment=ANTIGONA_JOBS_DIR=/var/lib/antigona/jobs
+Environment=ANTIGONA_STATE_ROOT=/var/lib/antigona
+Environment=ANTIGONA_IMMUTABLE_DEPLOYMENT=1
+WorkingDirectory=@ANTIGONA_ROOT@
+ExecStart=@ANTIGONA_ROOT@/.venv/bin/python -c 'from antigona.delivery_worker import main; main()'
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/antigona /var/log/antigona /run/antigona
+BindReadOnlyPaths=/var/lib/antigona/health:@ANTIGONA_ROOT@/.health @ANTIGONA_ROOT@ @ANTIGONA_UV_PYTHON@ @ANTIGONA_ENV_FILE@
+
+[Install]
+WantedBy=multi-user.target

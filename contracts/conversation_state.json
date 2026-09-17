@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConversationState",
+  "type": "object",
+  "required": [
+    "session_id",
+    "recent_messages",
+    "active_topic",
+    "active_task_id",
+    "pending_approval",
+    "selected_model"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "recent_messages": {
+      "type": "array"
+    },
+    "active_topic": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "active_task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pending_approval": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "selected_model": {
+      "type": "string"
+    }
+  }
+}

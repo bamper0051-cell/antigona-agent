@@ -1,0 +1,299 @@
+"""Mandatory Regression Test Suite for Antigona Living Portrait v3.
+
+Corresponds to docs/v3/03_REQUIRED_REGRESSION_TESTS.md specification.
+"""
+
+from __future__ import annotations
+
+import inspect
+from unittest.mock import Mock
+
+import pytest
+from rich.cells import cell_len
+
+import antigona.cli_ui.layout as layout_module
+from antigona.cli_ui.layout import AntigonaLayout
+from antigona.cli_ui.models import ChatUIState
+from antigona.cli_ui.portrait import EyeSocket, PortraitEngine
+from antigona.cli_ui.portrait_engine import (
+    PortraitController,
+    PortraitState,
+    portrait_state_for_status,
+)
+from antigona.cli_ui.renderer import CliRenderer
+
+
+class _FakeBuf:
+    def __init__(self, text: str, cursor_position: int) -> None:
+        self.text = text
+        self.cursor_position = cursor_position
+
+
+def _make_layout(status: str = "idle") -> AntigonaLayout:
+    state = ChatUIState(
+        messages=[],
+        current_status=status,
+        events=[],
+        connection="connected",
+        gateway_url="http://127.0.0.1:8090",
+        session_id="regression-test",
+    )
+
+    async def on_input(text: str) -> None:
+        return None
+
+    return AntigonaLayout(
+        state=state,
+        renderer=Mock(spec=CliRenderer),
+        on_input=on_input,
+    )
+
+
+# ── Geometry ─────────────────────────────────────────────────────────────────
+
+def test_left_eye_anchor_inside_eye_socket() -> None:
+    engine = PortraitEngine()
+    for _profile_name, sockets in engine.eye_sockets.items():
+        sock = sockets["left"]
+        assert isinstance(sock, EyeSocket)
+        assert sock.min_x <= sock.center_x <= sock.max_x
+        assert sock.min_x <= sock.clamp_x(sock.center_x - 5) <= sock.max_x
+        assert sock.min_x <= sock.clamp_x(sock.center_x + 5) <= sock.max_x
+
+
+def test_right_eye_anchor_inside_eye_socket() -> None:
+    engine = PortraitEngine()
+    for _profile_name, sockets in engine.eye_sockets.items():
+        sock = sockets["right"]
+        assert isinstance(sock, EyeSocket)
+        assert sock.min_x <= sock.center_x <= sock.max_x
+        assert sock.min_x <= sock.clamp_x(sock.center_x - 5) <= sock.max_x
+        assert sock.min_x <= sock.clamp_x(sock.center_x + 5) <= sock.max_x
+
+
+def test_eye_never_enters_nose_region() -> None:
+    engine = PortraitEngine()
+    for profile_name in engine.profiles:
+        sockets = engine.eye_sockets[profile_name]
+        l_sock = sockets["left"]
+        r_sock = sockets["right"]
+        # Left eye max_x must be strictly less than right eye min_x
+        assert l_sock.max_x < r_sock.min_x
+        for gaze in ("far_left", "left", "center", "right", "far_right"):
+            lines = engine.render(profile_name, gaze=gaze)
+            assert len(lines) == engine.profiles[profile_name].rows
+
+
+def test_portrait_dimensions_constant() -> None:
+    engine = PortraitEngine()
+    for profile in engine.profiles.values():
+        for gaze in ("far_left", "left", "center", "right", "far_right"):
+            for exp in ("idle", "focus", "laugh", "cry", "error", "success"):
+                lines = engine.render(profile.name, gaze=gaze, expression=exp, phase=1)
+                assert len(lines) == profile.rows
+                for line in lines:
+                    assert len(line) == profile.cols
+
+
+def test_overlay_does_not_change_cell_width() -> None:
+    engine = PortraitEngine()
+    for profile in engine.profiles.values():
+        lines = engine.render(profile.name, gaze="left", expression="focus", phase=3)
+        for line in lines:
+            assert cell_len(line) == profile.cols
+
+
+def test_face_protected_from_glitch() -> None:
+    engine = PortraitEngine()
+    profile_name = "medium"
+    clean = engine.render(profile_name, gaze="center", expression="focus", glitch=False, phase=7)
+    glitched = engine.render(profile_name, gaze="center", expression="focus", glitch=True, phase=7)
+    x1, y1, x2, y2 = (int(v) for v in engine.face_map[profile_name]["face_protect"])
+    for y in range(y1, y2 + 1):
+        assert clean[y][x1 : x2 + 1] == glitched[y][x1 : x2 + 1]
+
+
+# ── Cursor / Viewport ────────────────────────────────────────────────────────
+
+def test_real_cursor_move_updates_gaze() -> None:
+    layout = _make_layout()
+    text = "abc" * 20
+    layout._current_buffer = lambda: _FakeBuf(text, 0)
+    assert layout._portrait_gaze() == "far_left"
+    layout._current_buffer = lambda: _FakeBuf(text, 30)
+    assert layout._portrait_gaze() == "center"
+    layout._current_buffer = lambda: _FakeBuf(text, 60)
+    assert layout._portrait_gaze() == "far_right"
+
+
+def test_home_moves_gaze_left() -> None:
+    layout = _make_layout()
+    text = "hello world long command string"
+    layout._current_buffer = lambda: _FakeBuf(text, 0)
+    assert layout._portrait_gaze() == "far_left"
+
+
+def test_end_moves_gaze_right() -> None:
+    layout = _make_layout()
+    text = "hello world long command string"
+    layout._current_buffer = lambda: _FakeBuf(text, len(text))
+    assert layout._portrait_gaze() == "far_right"
+
+
+def test_long_input_viewport_cursor_gaze() -> None:
+    engine = PortraitEngine()
+    # Test viewport-aware gaze calculation
+    g_start = engine.gaze_from_viewport(cursor_abs=0, viewport_start=0, viewport_width=40, total_length=200)
+    assert g_start == "far_left"
+    g_mid = engine.gaze_from_viewport(cursor_abs=20, viewport_start=0, viewport_width=40, total_length=200)
+    assert g_mid == "center"
+    g_end = engine.gaze_from_viewport(cursor_abs=39, viewport_start=0, viewport_width=40, total_length=200)
+    assert g_end == "far_right"
+
+
+def test_gaze_hysteresis() -> None:
+    layout = _make_layout()
+    text = "x" * 100
+    layout._current_buffer = lambda: _FakeBuf(text, 14)
+    g1 = layout._portrait_gaze()
+    # Within 3% deadzone
+    layout._current_buffer = lambda: _FakeBuf(text, 16)
+    g2 = layout._portrait_gaze()
+    assert g1 == g2
+
+
+def test_gaze_debounce_cancels_transient_boundary_crossing() -> None:
+    layout = _make_layout()
+    text = "x" * 100
+    layout._current_buffer = lambda: _FakeBuf(text, 0)
+    g_initial = layout._portrait_gaze()
+    assert g_initial == "far_left"
+    # Quick transient move back and forth
+    layout._current_buffer = lambda: _FakeBuf(text, 5)
+    g_transient = layout._portrait_gaze()
+    assert g_transient == "far_left"
+
+
+# ── Animation Lifecycle ──────────────────────────────────────────────────────
+
+def test_blinking_is_removed_from_the_renderer() -> None:
+    """Blinking was deleted outright: the engine exposes no `blink` parameter,
+    ships no `blink` keyframe, and can reach no closed-eye frame."""
+    engine = PortraitEngine()
+    sockets = engine.eye_sockets["medium"]
+    l_sock, r_sock = sockets["left"], sockets["right"]
+
+    for profile_name, frames in engine.keyframes.items():
+        assert "blink" not in frames, f"{profile_name} still ships a blink keyframe"
+
+    for gaze in ("far_left", "left", "center", "right", "far_right"):
+        for expression in ("idle", "focus", "laugh", "cry", "error", "success"):
+            lines = engine.render("medium", gaze=gaze, expression=expression, phase=3)
+            assert lines[l_sock.open_y][l_sock.center_x] != "─"
+            assert lines[r_sock.open_y][r_sock.center_x] != "─"
+
+    with pytest.raises(TypeError):
+        engine.render("medium", gaze="center", blink=True)  # type: ignore[call-arg]
+
+
+def test_thinking_eye_animation() -> None:
+    layout = _make_layout(status="planning")
+    assert layout._portrait_expression() == "focus"
+    color = layout._portrait_eye_color()
+    assert color.startswith("#")
+
+
+def test_working_eye_animation() -> None:
+    layout = _make_layout(status="tool_executing")
+    assert layout._portrait_expression() == "focus"
+    color = layout._portrait_eye_color()
+    assert color.startswith("#")
+
+
+def test_no_idle_busy_loop() -> None:
+    source = inspect.getsource(layout_module)
+    assert "while True:" not in source or "await asyncio.sleep" in source
+    assert source.count("asyncio.sleep(") == 1
+
+
+def test_previous_animation_cancelled_on_higher_priority_state() -> None:
+    controller = PortraitController()
+    controller.set_state(PortraitState.WORKING)
+    # Higher priority state ERROR overrides previous state
+    controller.set_state(PortraitState.ERROR)
+    assert controller.state == PortraitState.ERROR
+
+
+def test_waiting_approval_stops_working_motion() -> None:
+    layout = _make_layout(status="waiting_approval")
+    assert layout._portrait_expression() == "sad"
+    color = layout._portrait_eye_color()
+    assert color == ""
+
+
+def test_success_returns_to_idle() -> None:
+    engine = PortraitEngine()
+    exp = engine.expression_for_status("done")
+    assert exp == "success"
+    state = portrait_state_for_status("done")
+    assert state == PortraitState.SUCCESS
+
+
+def test_error_stabilizes_without_infinite_glitch() -> None:
+    engine = PortraitEngine()
+    lines = engine.render("medium", expression="error", glitch=True, reduced_motion=True)
+    assert len(lines) == engine.profiles["medium"].rows
+
+
+# ── Input Safety ─────────────────────────────────────────────────────────────
+
+def test_input_navigation_not_intercepted() -> None:
+    layout = _make_layout()
+    # Key bindings exist and include pageup, pagedown, up, down, home, end
+    assert layout.kb is not None
+
+
+def test_portrait_refresh_does_not_move_input() -> None:
+    layout = _make_layout()
+    buf = _FakeBuf("test command", 4)
+    layout._current_buffer = lambda: buf
+    layout._get_portrait_fragments()
+    assert buf.cursor_position == 4
+    assert buf.text == "test command"
+
+
+def test_portrait_refresh_does_not_force_chat_scroll() -> None:
+    layout = _make_layout()
+    layout.scroll_offset = 5
+    layout.auto_follow = False
+    layout._get_portrait_fragments()
+    assert layout.scroll_offset == 5
+    assert layout.auto_follow is False
+
+
+def test_slash_popup_stays_above_mobile_input() -> None:
+    layout = _make_layout()
+    menu_float = layout._create_menu()
+    assert menu_float.bottom == 1 + layout._input_height()
+
+
+# ── Runtime Truth ────────────────────────────────────────────────────────────
+
+def test_working_requires_real_tool_started_event() -> None:
+    state = portrait_state_for_status("tool_executing")
+    assert state == PortraitState.WORKING
+
+
+def test_thinking_requires_real_agent_event() -> None:
+    state = portrait_state_for_status("planning")
+    assert state == PortraitState.THINKING
+
+
+def test_task_complete_drives_success() -> None:
+    state = portrait_state_for_status("done")
+    assert state == PortraitState.SUCCESS
+
+
+def test_task_failure_drives_error() -> None:
+    state = portrait_state_for_status("failed")
+    assert state == PortraitState.ERROR

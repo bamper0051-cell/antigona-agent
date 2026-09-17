@@ -1,0 +1,23 @@
+%ASKILL 1
+%id       skl-4d1a6f92-3c07-4b58-8e21-7a0b5c9d3e64
+%slug     minimal-probe
+%version  1
+%owner    owner-42
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Минимальная карточка для негативных проб парсера.
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "{{slot:missing}}/probe.md"
+
+[origin]
+flow              flow-00001
+steps             1
+captured          2026-07-26T08:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:e2a01780f3ed07b6eeb2a5d0e042b7ae78685505a98c9df5a03b96dd5907fbd9 bytes=484

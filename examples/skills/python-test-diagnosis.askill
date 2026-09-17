@@ -1,0 +1,38 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def09002
+%slug     python-test-diagnosis
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Последовательная диагностика Python/pytest-проектов.
+> Читает конфиги, проверяет синтаксис, запускает тесты от изменённых модулей к полному suite.
+
+[match] mode=any
+kw             тест | test | pytest | тестирование | testing
+kw             unit | интеграция | падает | failing | ошибка теста
+kw             test error | timeout
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 524288
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "pyproject.toml"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              python-test-diagnosis-1
+steps             1
+captured          2026-07-28T18:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:9051f89f965ecb50a24830a452b7c877bfab236d8042c3a086fd599fce59ba13 bytes=1033

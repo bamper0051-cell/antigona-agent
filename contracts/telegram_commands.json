@@ -1,0 +1,59 @@
+{
+  "commands": [
+    {
+      "command": "start",
+      "handler": "start_command",
+      "planner": false
+    },
+    {
+      "command": "help",
+      "handler": "help_command",
+      "planner": false
+    },
+    {
+      "command": "setllm",
+      "handler": "model_picker",
+      "planner": false
+    },
+    {
+      "command": "model",
+      "handler": "show_model",
+      "planner": false
+    },
+    {
+      "command": "status",
+      "handler": "status_command",
+      "planner": false
+    },
+    {
+      "command": "cancel",
+      "handler": "cancel_run",
+      "planner": false
+    },
+    {
+      "command": "new",
+      "handler": "new_session",
+      "planner": false
+    },
+    {
+      "command": "resume",
+      "handler": "resume_session",
+      "planner": false
+    },
+    {
+      "command": "tasks",
+      "handler": "task_list",
+      "planner": false
+    },
+    {
+      "command": "approve",
+      "handler": "approval_decision",
+      "planner": false
+    },
+    {
+      "command": "reject",
+      "handler": "approval_decision",
+      "planner": false
+    }
+  ]
+}

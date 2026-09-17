@@ -1,0 +1,36 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def01
+%slug     huggingface-deployer
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Разворачивает и управляет Hugging Face Spaces.
+> Настраивает, деплоит, обновляет.
+
+[match] mode=any
+kw             huggingface | hugging face | space | spaces | деплой
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "pyproject.toml"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              huggingface-deployer-1
+steps             1
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:54d7a492814d5ba9463db07eaaa7267560e2dd2aa6267d7455d09ab7a7d19435 bytes=774

@@ -1,0 +1,18 @@
+[Unit]
+Description=Antigona Gateway (canonical launcher, 2026-08-15)
+After=network.target
+Wants=network.target
+
+[Service]
+EnvironmentFile=-@ANTIGONA_ENV_FILE@
+Type=simple
+WorkingDirectory=@ANTIGONA_ROOT@
+ExecStartPre=@ANTIGONA_ROOT@/scripts/startup_gate.sh
+ExecStart=@ANTIGONA_ROOT@/scripts/service_wrapper.sh gateway
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

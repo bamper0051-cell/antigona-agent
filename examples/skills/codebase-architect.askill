@@ -1,0 +1,43 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def08
+%slug     codebase-architect
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Исследует архитектуру Antigona: читает ключевые файлы проекта
+> и возвращает структурированную информацию о состоянии кодовой базы.
+
+[match] mode=any
+kw             архитектура | architecture | codebase | структура | модули
+kw             проект
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "docs/ARCHITECTURE.md"
+2 tool workspace.read_text
+  ~ path = "README.md"
+3 tool workspace.read_text
+  ~ path = "docs/ARCHITECTURE_MAP.md"
+4 tool workspace.read_text
+  ~ path = "CHANGELOG.md"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              codebase-architect-1
+steps             4
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:0869ccb909e32027c24415a9f508c47d15b0ba5b41b9fca03af01963df202b40 bytes=1103

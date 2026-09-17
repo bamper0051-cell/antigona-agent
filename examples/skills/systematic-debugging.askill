@@ -1,0 +1,38 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def09001
+%slug     systematic-debugging
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Проверяемая диагностика ошибок без бессмысленного перебора команд.
+> Фиксирует симптом, формулирует гипотезу, проверяет, исправляет, верифицирует.
+
+[match] mode=any
+kw             дебаг | debug | ошибка | error | баг
+kw             bug | не работает | падение | crash | исключение
+kw             exception | traceback | отладка
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 524288
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "pyproject.toml"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              systematic-debugging-1
+steps             1
+captured          2026-07-28T18:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:483c1f75402a50e60395d18e650b4e7f3f781a8e85f4607804cf4d4f82f7d8bb bytes=1053

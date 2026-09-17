@@ -1,0 +1,151 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "antigona"
+version = "1.0.0"
+description = "Clean-room P0 autonomous-agent harness"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "fastapi>=0.115,<1",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "pydantic>=2.9,<3",
+  "psycopg[binary]>=3.2,<4",
+  "pgvector>=0.4,<1",
+  "uvicorn>=0.30,<1",
+  "httpx>=0.27,<1",
+  # P4.3 async durable storage: aiosqlite is the default fallback driver,
+  # alembic is the single source of schema evolution for Postgres.
+  "aiosqlite>=0.20,<1",
+  "alembic>=1.13,<2",
+  # Lazily imported (asyncpg only for postgresql+asyncpg URLs, redis only when
+  # ANTIGONA_REDIS_URL is set) — declared so a full deployment resolves them.
+  "asyncpg>=0.29,<1",
+  "redis>=5,<7",
+  # Web search via DuckDuckGo (free, no API key)
+  "duckduckgo_search>=8,<9",
+  "croniter>=2.0,<3",
+  # ── Runtime deps actually imported by the code (reproducible clean clone) ──
+  "aiogram>=3.14,<4",          # channels/telegram bot (aiogram 3.30 prod)
+  "rich>=13,<16",              # cli/tui/replay
+  "openai>=1.30,<2",           # voice/stt, voice/tts
+  "prompt_toolkit>=3.0,<4",    # cli_ui/prompts
+  "pyotp>=2.9,<3",             # security/totp (owner auth)
+  "websockets>=12,<17",        # core/gateway_client, transport/telegram
+  "PyYAML>=6.0,<7",            # plugins/plugin
+  "aiofiles>=23,<26",          # durable/agent_loop
+  "typer>=0.12,<1",            # cli
+]
+
+[project.optional-dependencies]
+
+integrations = [
+  "deepseek-tokenizer>=0.3,<1",
+  "mlflow>=2.10,<3",
+  "feedparser>=6,<7",
+  "mcp>=1,<2",
+  "acp-sdk>=1,<2",
+]
+dev = [
+  "httpx>=0.27,<1",
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.9,<1",
+  "mypy>=1.14,<2",
+  "numpy<2.3",
+  "coverage[toml]>=7.6,<8",
+  # Dotenv loading is OPTIONAL at runtime (config.load_project_env falls back
+  # gracefully), but the cli-env tests exercise the real loader against a
+  # synthetic tmp .env — dev-only dependency, not a runtime contract change.
+  "python-dotenv>=1.0,<2",
+]
+# Heavy/feature-specific runtime deps — not required for the core stack.
+voice = [
+  "gtts>=2.5,<3",
+  "faster-whisper>=1.0,<2",
+  # numpy>=2.3 перешёл на Python 3.12-синтаксис в .pyi-стабах, что ломает
+  # `mypy --strict` (python_version=3.11) в CI. Ограничиваем до 2.2.x.
+  "numpy<2.3",
+]
+tui = [
+  # Optional half-block portrait art (assets/antigona_banner.png) in the CLI.
+  # Rendering degrades gracefully to the ASCII banner when Pillow is absent.
+  "Pillow>=10.0",
+
+  "textual>=0.80,<9",
+]
+sandbox = [
+  "e2b>=1.0,<2",
+  "e2b-code-interpreter>=1.0,<2",
+]
+browser = [
+  "playwright>=1.40,<2",
+]
+
+[project.scripts]
+antigona = "antigona.cli:main"
+antigona-cli = "antigona.cli:main"
+antigona-gateway = "antigona.gateway:main"
+antigona-worker = "antigona.worker:main"
+antigona-verifier = "antigona.verifier_service:main"
+antigona-delivery = "antigona.delivery_worker:main"
+antigona-tui = "antigona.tui:main"
+antigona-tui-control = "antigona.tui_control:main"
+antigona-console = "antigona.tui_console:main"
+antigona-bot = "antigona.channels.telegram.bot:main"
+antigona-api = "antigona.api.server:main"
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/antigona"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["antigona"]
+omit = ["src/antigona/gateway.py", "src/antigona/worker.py", "src/antigona/delivery_worker.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "E701", "E702"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src"]
+
+# Optional integration dependencies — present in some environments only.
+[[tool.mypy.overrides]]
+module = [
+    "deepseek_tokenizer",
+    "feedparser",
+    "mlflow",
+    "mcp",
+    "mcp.client.stdio",
+    "mcp.client.sse",
+    "mcp.client.streamable_http",
+    "acp_sdk",
+    "acp_sdk.client",
+    "dotenv",
+    "gtts",
+    "playwright.async_api",
+    "faster_whisper",
+]
+ignore_missing_imports = true

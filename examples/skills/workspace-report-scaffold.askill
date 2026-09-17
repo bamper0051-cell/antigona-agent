@@ -1,0 +1,51 @@
+%ASKILL 1
+%id       skl-9f3c2a5e-71b4-4f0d-9a6e-8c2d13f45b70
+%slug     workspace-report-scaffold
+%version  3
+%owner    owner-42
+%trust    trusted
+%risk     MEDIUM
+
+[intent]
+> Создаёт каталог отчёта в workspace и кладёт туда индексный файл со сводкой.
+> Применяется, когда пользователь просит «собрать отчёт» в существующем workspace.
+
+[match] mode=all
+kw             отчёт | report | сводка
+path-prefix    reports/
+tool-available workspace.write_text
+
+[require]
+limit  max-steps = 6
+limit  max-bytes = 262144
+state  workspace.writable = true
+
+[slots]
+report_dir   : path   required  default = "reports/latest"
+title        : text   optional  default = "Отчёт"
+
+[plan]
+1 tool workspace.mkdir
+  ~ path = "{{slot:report_dir}}"
+2 tool workspace.write_text
+  ~ path = "{{slot:report_dir}}/index.md"
+  ~ content = <<
+    # {{slot:title}}
+    Раздел заполняется исполнителем шага.
+  >>
+3 tool workspace.read_text
+  ~ path = "{{slot:report_dir}}/index.md"
+
+[claims]
+produces-file      {{slot:report_dir}}/index.md
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              flow-12345
+steps             3
+captured          2026-07-26T10:12:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:920e608ee6e5bc4285bf28bf185b62cff246dd02281ce62f291d035cf1626409 bytes=1375

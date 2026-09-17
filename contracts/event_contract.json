@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antigona Runtime Event",
+  "type": "object",
+  "required": [
+    "event_id",
+    "run_id",
+    "type",
+    "timestamp",
+    "payload"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "type": {
+      "enum": [
+        "run.started",
+        "routing.completed",
+        "model.delta",
+        "model.completed",
+        "tool.requested",
+        "approval.required",
+        "tool.started",
+        "tool.output",
+        "tool.completed",
+        "verification.completed",
+        "checkpoint.saved",
+        "run.completed",
+        "run.failed",
+        "run.cancelled"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}

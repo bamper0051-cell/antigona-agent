@@ -1,0 +1,26 @@
+%ASKILL 1
+%id       skl-4d1a6f92-3c07-4b58-8e21-7a0b5c9d3e64
+%slug     minimal-probe
+%version  1
+%owner    owner-42
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Минимальная карточка для негативных проб парсера.
+
+[slots]
+retries      : int    optional  default = "three"
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "{{slot:retries}}"
+
+[origin]
+flow              flow-00001
+steps             1
+captured          2026-07-26T08:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:1ae5af903fb15bb32c2b1ce81a8a6dddf47cb723c64a0311c484622129f430fa bytes=534
