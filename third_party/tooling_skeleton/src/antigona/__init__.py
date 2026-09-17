@@ -1,0 +1,1 @@
+"""Antigona tooling skeleton package."""

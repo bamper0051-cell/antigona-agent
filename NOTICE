@@ -1,0 +1,20 @@
+Antigona
+Copyright 2026 Antigona contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party components
+----------------------
+1. Hermes Agent - Copyright (c) 2025 Nous Research - MIT License.
+   Vendored copy: third_party/hermes/
+   Upstream: https://github.com/NousResearch/hermes-agent
+   MIT license text: third_party/hermes/LICENSE
+   Upstream manifest: third_party/hermes/UPSTREAM_MANIFEST.md,
+                      third_party/hermes/UPSTREAM_MANIFEST.yaml
+   The MIT permission notice must be retained for the vendored copy.
+
+2. third_party/tooling_skeleton/ is first-party Antigona code (Apache-2.0),
+   not a third-party component.
+
+All other files are original Antigona work, licensed under Apache-2.0 unless a
+file states otherwise.

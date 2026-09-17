@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — config.load_project_env reads .env from the project root; it must
+# never be committable. Example files without values stay tracked.
+.env
+.env.*
+!.env.example
+
+# Runtime state (never part of the immutable code root) — governed by
+# core.paths (ANTIGONA_STATE_ROOT) and excluded from the production manifest.
+.memory/
+.tasks/
+.task_messages/
+.context/
+.voice_cache/
+.voice_settings.json
+.health/
+.logs/
+workspace/
+downloads/
+antigona.db
+antigona_sessions.db
+antigona_memory.db
+audit.db
+audit_log.db
+cli_state.json
+cli_state.json.tmp
+elevation.db
+traces.db
+traces.jsonl
+mcp_servers.json
+owner_pin.json
+cli_aliases.json
+cli_theme.json
+cli_user_themes.json
+legacy_reachability.jsonl

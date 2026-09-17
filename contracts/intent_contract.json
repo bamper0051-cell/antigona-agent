@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Antigona IntentDecision",
+  "type": "object",
+  "required": [
+    "intent",
+    "confidence",
+    "response_mode",
+    "requires_planner",
+    "requires_approval",
+    "entities",
+    "reason_code"
+  ],
+  "properties": {
+    "intent": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "response_mode": {
+      "enum": [
+        "conversation",
+        "answer",
+        "clarify",
+        "command_result",
+        "task_preview",
+        "task_progress",
+        "task_result",
+        "degraded"
+      ]
+    },
+    "requires_planner": {
+      "type": "boolean"
+    },
+    "requires_approval": {
+      "type": "boolean"
+    },
+    "entities": {
+      "type": "object"
+    },
+    "reason_code": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

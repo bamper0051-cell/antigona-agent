@@ -1,0 +1,53 @@
+[Unit]
+Description=Antigona Sandbox Docker Socket Proxy (narrowly-scoped least-privilege bridge)
+Documentation=deploy/sandbox/docker_socket_proxy.py
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=antigona-svc
+Group=antigona-svc
+# ONLY this dedicated unit is granted Docker socket access (via the docker
+# group).  The six Antigona application units never hold it; they reach the
+# daemon exclusively through the allowlisted unix socket below.
+SupplementaryGroups=docker
+# Read the same policy source as the worker so the sanctioned runc fallback
+# hatch (ANTIGONA_SANDBOX_ALLOW_RUNC_FALLBACK) and workspace path cannot diverge.
+EnvironmentFile=-@ANTIGONA_ENV_FILE@
+Environment=HOME=/var/lib/antigona
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=ANTIGONA_DOCKER_UPSTREAM=/var/run/docker.sock
+Environment=ANTIGONA_DOCKER_PROXY_SOCKET=/run/antigona/docker.sock
+WorkingDirectory=@ANTIGONA_ROOT@
+ExecStartPre=@ANTIGONA_ROOT@/scripts/startup_gate.sh
+ExecStart=/usr/bin/python3 @ANTIGONA_ROOT@/deploy/sandbox/docker_socket_proxy.py
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/run/antigona
+BindReadOnlyPaths=@ANTIGONA_ROOT@
+
+[Install]
+WantedBy=multi-user.target

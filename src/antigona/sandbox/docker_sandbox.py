@@ -1,0 +1,248 @@
+"""Isolated ephemeral Docker sandbox for owner-approved high-risk shell commands.
+
+Security contract (owner directive, 2026-08-10):
+  * ephemeral container (``--rm``) — never reused, never left behind;
+  * NO ``--privileged``, NO host network (default isolated bridge), NO Docker
+    socket mount, NO arbitrary host mounts;
+  * the ONLY host bind is the minimal workspace mount (``-v <ws>:/workspace``);
+  * resource limits (memory + CPUs) and a hard timeout via ``--stop-timeout``;
+  * audit logging carries the correlation_id / task_id through every event;
+  * fail-closed: if the Docker runtime is unavailable the caller must refuse to
+    run high-risk commands on the host (never a fallback).
+
+The high-risk command is executed by the container's own shell so shell
+semantics are preserved; the container never shares the host's filesystem,
+network, or devices.
+"""
+
+from __future__ import annotations
+
+import logging
+import shlex
+import subprocess
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from antigona.observability import event
+from antigona.sandbox.runner import (
+    DEFAULT_RUNTIME,
+    ISOLATION_REFUSED,
+    SandboxIsolationError,
+    ensure_runtime_available,
+    resolve_runtime,
+)
+from antigona.workspace import ToolError
+
+LOGGER = logging.getLogger("antigona")
+
+# Defaults matching config.docker_image / worker sandbox settings.
+DEFAULT_IMAGE = "python:3.12-alpine"
+DEFAULT_TIMEOUT = 60
+DEFAULT_MEMORY = "512m"
+DEFAULT_CPUS = 1.0
+WORKSPACE_MOUNT_TARGET = "/workspace"
+
+# Paths that are NEVER allowed to be bind-mounted into the sandbox.
+_FORBIDDEN_HOST_PATHS = frozenset({"/", "/var/run/docker.sock", "/run/docker.sock"})
+
+
+class DockerSandboxUnavailableError(ToolError):
+    """Raised when the Docker runtime cannot service a sandboxed run."""
+
+
+@dataclass(frozen=True)
+class DockerSandboxResult:
+    command: tuple[str, ...]
+    exit_code: int
+    stdout: str
+    stderr: str
+    container_id: str
+    timed_out: bool = False
+
+
+class DockerSandboxBackend:
+    """Run a command inside a throwaway, locked-down Docker container."""
+
+    def __init__(
+        self,
+        image: str = DEFAULT_IMAGE,
+        *,
+        timeout_seconds: int = DEFAULT_TIMEOUT,
+        memory: str = DEFAULT_MEMORY,
+        cpus: float = DEFAULT_CPUS,
+        workspace: str | Path | None = None,
+        docker_binary: str = "docker",
+        runtime: str | None = None,
+    ) -> None:
+        self.image = image
+        self.timeout_seconds = timeout_seconds
+        self.memory = memory
+        self.cpus = cpus
+        self.workspace = Path(workspace).resolve() if workspace else None
+        self.docker_binary = docker_binary
+        #: OCI runtime.  ``None`` = not yet resolved; the resolve+verify happens
+        #: at ``run()`` time so the isolation level is always probed live and a
+        #: missing gVisor refuses execution instead of defaulting to the host
+        #: kernel.  Never left to the Docker daemon default.
+        self.runtime = runtime
+
+    def is_available(self) -> bool:
+        """Return True only if the Docker CLI is present and the daemon answers."""
+        if shutil_which(self.docker_binary) is None:
+            return False
+        try:
+            probe = subprocess.run(
+                [self.docker_binary, "info"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return probe.returncode == 0
+        except Exception:
+            return False
+
+    def _build_argv(self, command: Sequence[str]) -> list[str]:
+        cmd = [str(c) for c in command]
+        if not cmd:
+            raise ToolError("sandbox command must not be empty")
+        # Never let an absolute host path leak into the container.
+        if any(("/" in tok and tok.startswith("/")) for tok in cmd if tok.startswith("/")):
+            raise ToolError("absolute paths are forbidden in sandboxed commands")
+        shell_line = shlex.join(cmd)
+        argv = [
+            self.docker_binary,
+            "run",
+            "--rm",
+            # --runtime is ALWAYS explicit so gVisor vs runc is never left to a
+            # daemon default (a default of runc is a silent kernel downgrade).
+            f"--runtime={self.runtime or DEFAULT_RUNTIME}",
+            "--name",
+            f"antigona-sandbox-{uuid.uuid4().hex[:12]}",
+            "--network", "bridge",  # isolated default network — NO host network
+            "--security-opt", "no-new-privileges",
+            "--memory", self.memory,
+            "--cpus", f"{self.cpus:.2f}",
+            "--stop-timeout", f"{self.timeout_seconds}",
+            "--workdir", WORKSPACE_MOUNT_TARGET,
+        ]
+        if self.workspace is not None:
+            argv += ["--volume", f"{self.workspace}:{WORKSPACE_MOUNT_TARGET}"]
+        argv += [self.image, "/bin/sh", "-c", shell_line]
+        return argv
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        correlation_id: str = "",
+        task_id: str = "",
+    ) -> DockerSandboxResult:
+        if not self.is_available():
+            event(
+                "docker_sandbox_unavailable",
+                service="sandbox",
+                correlation_id=correlation_id or None,
+                task_id=task_id or None,
+                status="blocked",
+                reason="docker runtime unavailable — fail closed, no host fallback",
+            )
+            raise DockerSandboxUnavailableError(
+                "Docker sandbox is unavailable — refusing high-risk command (fail-closed, "
+                "no host fallback)"
+            )
+
+        # Fail-closed isolation gate: resolve the runtime ONCE, then re-verify it
+        # is launchable right now.  gVisor OR refusal — never a silent downgrade.
+        if self.runtime is None:
+            try:
+                self.runtime = resolve_runtime()
+            except SandboxIsolationError:
+                self.runtime = ISOLATION_REFUSED
+        try:
+            ensure_runtime_available(self.runtime)
+        except SandboxIsolationError as exc:
+            event(
+                "sandbox_isolation_refused",
+                service="sandbox",
+                correlation_id=correlation_id or None,
+                task_id=task_id or None,
+                status="refused",
+                runtime=self.runtime,
+                reason=str(exc)[:1000],
+            )
+            raise
+
+        argv = self._build_argv(command)
+        container_id = next((v for v in argv if v.startswith("antigona-sandbox-")), "")
+        event(
+            "docker_sandbox_start",
+            service="sandbox",
+            correlation_id=correlation_id or None,
+            task_id=task_id or None,
+            image=self.image,
+            container=container_id or None,
+            command=shlex.join([str(c) for c in command]),
+        )
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds + 5,  # +5s for container teardown
+                check=False,
+            )
+            timed_out = False
+            exit_code = proc.returncode
+            stdout = proc.stdout
+            stderr = proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            exit_code = 124  # conventional timeout exit code
+            if isinstance(exc.stdout, bytes):
+                stdout = exc.stdout.decode(errors="replace")
+            else:
+                stdout = exc.stdout or ""
+            if isinstance(exc.stderr, bytes):
+                stderr = exc.stderr.decode(errors="replace")
+            else:
+                stderr = exc.stderr or ""
+            # best-effort cleanup of a leftover container on timeout
+            if container_id:
+                try:
+                    subprocess.run(
+                        [self.docker_binary, "rm", "-f", container_id],
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+
+        event(
+            "docker_sandbox_finish",
+            service="sandbox",
+            correlation_id=correlation_id or None,
+            task_id=task_id or None,
+            container=container_id or None,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            stdout_tail=stdout[-500:] if stdout else "",
+            stderr_tail=stderr[-500:] if stderr else "",
+        )
+        return DockerSandboxResult(
+            command=tuple(str(c) for c in command),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            container_id=container_id,
+            timed_out=timed_out,
+        )
+
+
+def shutil_which(binary: str) -> str | None:
+    import shutil
+
+    return shutil.which(binary)

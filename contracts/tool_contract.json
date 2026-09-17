@@ -1,0 +1,30 @@
+{
+  "name": "filesystem.read",
+  "description": "Read a UTF-8 text file inside the active workspace",
+  "permission": "READ_ONLY",
+  "timeout_seconds": 30,
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "path"
+    ],
+    "properties": {
+      "path": {
+        "type": "string"
+      },
+      "max_bytes": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2000000
+      }
+    }
+  },
+  "result": {
+    "status": "success|error|cancelled",
+    "summary": "string",
+    "data": "object",
+    "duration_ms": "integer",
+    "changed_paths": "array",
+    "verification": "object"
+  }
+}

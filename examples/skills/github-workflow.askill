@@ -1,0 +1,37 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def05
+%slug     github-workflow
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Управляет GitHub репозиториями: commit, push, PR, review.
+> Использует git CLI и gh CLI через shell.
+
+[match] mode=any
+kw             github | git | commit | push | pr
+kw             pull request | review
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "AGENTS.md"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              github-workflow-1
+steps             1
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:156086a0580be926812165a02802295e7de9e3e13a644b2c416f8598aa2290a9 bytes=778

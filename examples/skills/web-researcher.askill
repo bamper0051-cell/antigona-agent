@@ -1,0 +1,37 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def04
+%slug     web-researcher
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Ищет информацию в интернете, читает веб-страницы,
+> ищет научные статьи на arXiv.
+
+[match] mode=any
+kw             поиск | search | research | найти | научная
+kw             статья | arxiv
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "README.md"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              web-researcher-1
+steps             1
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:e653fa15ef420fc9cd0e332a22414f6c3d3bcfc0f11cabdf1a90e3c8b8a70fa5 bytes=805

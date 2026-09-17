@@ -1,0 +1,30 @@
+app:
+  theme: auto
+  default_mode: chat
+  confirmation: safe
+  max_turns: 30
+  tool_timeout_seconds: 120
+
+provider:
+  active: local-mock
+  profiles:
+    local-mock:
+      type: mock
+      model: deterministic
+    compatible:
+      type: openai_compatible
+      base_url: ${ANTIGONA_API_BASE_URL}
+      api_key_env: ANTIGONA_API_KEY
+      model: example-model
+
+sessions:
+  database: ~/.local/share/antigona/sessions.db
+  auto_checkpoint: true
+  compact_at_percent: 70
+
+tools:
+  workspace_only: true
+  protected_targets:
+    - hermes-gateway
+    - Hermes Gateway
+    - antigona-pg

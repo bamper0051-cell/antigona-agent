@@ -1,0 +1,76 @@
+schema_version: "1.0"
+
+upstream:
+project: "Hermes Agent"
+repository: "https://github.com/NousResearch/hermes-agent"
+version: "2026.7.20"
+commit: "REPLACE_WITH_VERIFIED_COMMIT_SHA"
+license: "MIT"
+license_file: "third_party/hermes/LICENSE"
+imported_at: "2026-07-28"
+
+integration:
+product: "Antigona"
+strategy: "adapter"
+source_of_truth: "Antigona"
+gateway_owner: "Antigona Gateway"
+task_store_owner: "Antigona PostgreSQL"
+completion_authority: "Antigona Verifier"
+
+allowed_components:
+
+- source: "agent/iteration_budget.py"
+  target: "src/antigona/hermes_bridge/iteration_budget.py"
+  mode: "adapted"
+  purpose: "Bound autonomous execution iterations"
+
+- source: "agent/error_classifier.py"
+  target: "src/antigona/hermes_bridge/error_classifier.py"
+  mode: "adapted"
+  purpose: "Classify provider and tool execution failures"
+
+- source: "agent/turn_context.py"
+  target: "src/antigona/hermes_bridge/turn_context.py"
+  mode: "adapted"
+  purpose: "Build isolated execution-turn context"
+
+- source: "agent/tool_executor.py"
+  target: "src/antigona/hermes_bridge/tool_executor_adapter.py"
+  mode: "wrapped"
+  purpose: "Return tool results to the agent loop"
+
+- source: "agent/context_compressor.py"
+  target: "src/antigona/hermes_bridge/context_compressor.py"
+  mode: "adapted"
+  purpose: "Compress long task histories safely"
+
+- source: "tools/delegate_tool.py"
+  target: "src/antigona/hermes_bridge/delegation_adapter.py"
+  mode: "adapted"
+  purpose: "Delegate work to durable child tasks"
+
+prohibited_components:
+
+- component: "Hermes Gateway"
+  reason: "Antigona must retain one Gateway"
+
+- component: "Hermes SQLite session store"
+  reason: "PostgreSQL remains the durable source of truth"
+
+- component: "Hermes completion authority"
+  reason: "Only Antigona Verifier may set DONE"
+
+- component: "Hermes identity and branding"
+  reason: "Antigona remains an independent product"
+
+- component: "Direct host tool execution"
+  reason: "All execution must pass through Antigona sandbox and policy"
+
+requirements:
+preserve_upstream_license: true
+record_source_file: true
+record_source_commit: true
+require_adapter_boundary: true
+require_antigona_tests: true
+require_security_review: true
+require_rollback_plan: true

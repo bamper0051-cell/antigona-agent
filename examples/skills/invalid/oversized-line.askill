@@ -1,0 +1,23 @@
+%ASKILL 1
+%id       skl-4d1a6f92-3c07-4b58-8e21-7a0b5c9d3e64
+%slug     minimal-probe
+%version  1
+%owner    owner-42
+%trust    trusted
+%risk     LOW
+
+[intent]
+> xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "notes/probe.md"
+
+[origin]
+flow              flow-00001
+steps             1
+captured          2026-07-26T08:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:af430bbe6b7c6393273020469078c57c50d57e6421e8af35fb95215f43de7755 bytes=601

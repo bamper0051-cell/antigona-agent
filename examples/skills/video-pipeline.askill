@@ -1,0 +1,36 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def03
+%slug     video-pipeline
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Создаёт видео: от концепции до готового файла.
+> Генерирует, анимирует, добавляет голос за кадром.
+
+[match] mode=any
+kw             видео | video | анимация | animation | ролик
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "docs/ROADMAP.md"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              video-pipeline-1
+steps             1
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:17ad8d254620af2cbf6698226038baf08e90799d8c46f576d1099ed1bbf20647 bytes=813

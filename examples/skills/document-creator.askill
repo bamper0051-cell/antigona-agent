@@ -1,0 +1,37 @@
+%ASKILL 1
+%id       skl-c0deb4a5e-1234-5678-9abc-def06
+%slug     document-creator
+%version  1
+%owner    example-owner
+%trust    trusted
+%risk     LOW
+
+[intent]
+> Создаёт документы в форматах .docx, .pdf, .xlsx
+> из Markdown или структурированных данных.
+
+[match] mode=any
+kw             документ | document | docx | pdf | xlsx
+kw             отчёт | report
+
+[require]
+limit  max-steps = 10
+limit  max-bytes = 1048576
+state  workspace.writable = false
+
+[plan]
+1 tool workspace.read_text
+  ~ path = "pyproject.toml"
+
+[claims]
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              document-creator-1
+steps             1
+captured          2026-07-28T12:00:00Z
+verdict           verifier-pass
+trust-at-capture  trusted
+
+%end sha256:1a01e77a897fb85a597db98908963fb51bf413df1ab39f2cdc3570109272aa3d bytes=803

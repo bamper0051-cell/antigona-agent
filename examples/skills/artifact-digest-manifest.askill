@@ -1,0 +1,51 @@
+%ASKILL 1
+%id       skl-2b7e41c0-5d38-4a91-b0f2-6e5a09d7c418
+%slug     artifact-digest-manifest
+%version  1
+%owner    owner-42
+%trust    untrusted
+%risk     LOW
+
+[intent]
+> Собирает манифест артефактов флоу: перечисляет каталог артефактов и заводит
+> файл манифеста, куда исполнитель шага вписывает по строке на артефакт.
+> Карточка снята с траектории, касавшейся untrusted-контента, поэтому её потолок риска — LOW.
+
+[match] mode=any
+kw             манифест | manifest | дайджест артефактов
+path-prefix    artifacts/
+tool-available workspace.write_text
+
+[slots]
+digest_dir   : path   required  default = "artifacts"
+manifest     : path   required  default = "artifacts/manifest.md"
+strict       : bool   optional  default = true
+
+[plan]
+1 tool workspace.list_dir
+  ~ path = "{{slot:digest_dir}}"
+  ~ recursive = true
+2 tool workspace.write_text
+  ~ path = "{{slot:manifest}}"
+  ~ content = <<
+    # Манифест артефактов
+
+    Одна строка на артефакт: путь, размер в байтах, sha256.
+  >>
+3 tool workspace.read_text
+  ~ path = "{{slot:manifest}}"
+  ~ fail_on_empty = "{{slot:strict}}"
+
+[claims]
+produces-file      {{slot:manifest}}
+produces-nonempty  true
+no-network         true
+
+[origin]
+flow              flow-88213
+steps             3
+captured          2026-07-26T09:41:00Z
+verdict           verifier-pass
+trust-at-capture  untrusted
+
+%end sha256:29264a80c8126e3b4c760842507723988e6d58265118dd378dc351020abe524b bytes=1606

@@ -1,0 +1,20 @@
+# Normalize line endings — the repo canonical form is LF everywhere.
+# Windows checkouts must NOT convert to CRLF (skill parser is LF-only;
+# CRLF breaks tests and artifacts).
+* text=auto eol=lf
+
+# Negative-test fixture: this file MUST stay CRLF (parser must reject it as E-ENC).
+examples/skills/invalid/crlf-line-endings.askill -text
+
+# Explicitly binary (never renormalized)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp3 binary
+*.ogg binary
+*.wav binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary

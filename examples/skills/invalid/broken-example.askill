@@ -1,0 +1,13 @@
+%ASKILL 1
+%id    skl-bad-0001
+%slug  broken-example
+%hint  произвольная директива
+
+[plan]
+1 tool workspace.write_text
+  ~ path = "{{slot:missing}}"
+
+[intent]
+> описание
+
+%end sha256:0000 bytes=0

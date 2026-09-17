@@ -1,0 +1,54 @@
+# Architecture Guard baseline — существующие нарушения Unified Paths API (ADR-007).
+#
+# ПРАВИЛО: эта таблица ОБЯЗАНА сокращаться по мере рефакторинга на core/paths.py.
+# Добавлять НОВЫЕ строки сюда запрещено — это фиксация архитектурного долга,
+# а не его одобрение. Новые файлы/строки с этими паттернами (не в списке ниже)
+# валят CI (arch_guard exit 1).
+#
+# Формат: <относительный_путь_в_src/antigona>:<PATTERN>
+#
+# Легенда статуса:
+#   [MODIFIED] — файл имеет pre-existing незакоммиченные изменения; рефакторинг
+#                отложен до отдельного approval (не смешивать с чужой работой).
+#   [USER-INPUT] — expanduser на пользовательском вводе (@file/@folder, скрипт cron);
+#                  легитимный ввод, НЕ внутренний резолв путей (исключение M7).
+
+# [MODIFIED] bot.py — download_root; рефакторинг после approval по bot.py.
+channels/telegram/bot.py:P3_abs_root_path
+# [MODIFIED] bot.py — cwd= и path-default хардкоды корня; рефакторинг после approval.
+channels/telegram/bot.py:P6_string_root
+# [MODIFIED] provider_setup.py — secrets path.
+conversation/provider_setup.py:P1_home
+# [USER-INPUT] cron/scheduler.py — expanduser пользовательского script_path.
+cron/scheduler.py:P2_expanduser
+# [MODIFIED] plugins/plugin.py — skills/plugins path.
+plugins/plugin.py:P1_home
+# [MODIFIED] vault.py — vault path.
+secrets/vault.py:P1_home
+# [USER-INPUT] context_refs.py — expanduser пользовательских @file/@folder.
+tools/context_refs.py:P2_expanduser
+# [MODIFIED] key_manager.py — secrets path.
+tools/key_manager.py:P1_home
+# [MODIFIED] provider_switcher.py — secrets path.
+tools/provider_switcher.py:P1_home
+# [DOCSTRING] worker_adapter.py — пример в docstring (Usage::), не код.
+turn_bridge/worker_adapter.py:P6_string_root
+# [DOCSTRING] worker_integration.py — пример в docstring (Usage::), не код.
+turn_bridge/worker_integration.py:P6_string_root
+
+# PR-01 consolidation inventory — pre-existing legacy imports. These entries
+# keep the guard focused on preventing new violations; migration is separate.
+channels/telegram/context_adapter.py:P8_legacy_event_bus
+channels/telegram/status_renderer.py:P8_legacy_event_bus
+tasks/__init__.py:P8_legacy_event_bus
+tools/__init__.py:P7_legacy_tool_abc
+tools/archive_ops.py:P7_legacy_tool_abc
+tools/document_ops.py:P7_legacy_tool_abc
+tools/filesystem_read.py:P7_legacy_tool_abc
+tools/filesystem_write.py:P7_legacy_tool_abc
+tools/registry.py:P7_legacy_tool_abc
+tools/system_time.py:P7_legacy_tool_abc
+tools/terminal.py:P7_legacy_tool_abc
+tools/tts_tool.py:P7_legacy_tool_abc
+voice/stt.py:P9_direct_provider_sdk
+voice/tts.py:P9_direct_provider_sdk
