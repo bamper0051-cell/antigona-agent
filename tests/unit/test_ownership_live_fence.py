@@ -152,7 +152,16 @@ def test_registry_write_file_fences_stale_owner(tmp_path: Path) -> None:
         _close(cleaners)
 
 
-def test_registry_write_file_live_owner_permitted(tmp_path: Path) -> None:
+def test_registry_write_file_live_owner_permitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The registry handler has ONE writable root: the canonical workspace
+    # (``ANTIGONA_WORKSPACE`` -> ``paths.workspace_dir()``), not the test's bare
+    # ``tmp_path``.  Point the env at the same root so this test keeps measuring
+    # the OWNERSHIP fence (a live owner is permitted) rather than the
+    # path-authorization rule (A-CORE-001: an absolute out-of-workspace write
+    # needs a consumed owner grant).
+    monkeypatch.setenv("ANTIGONA_WORKSPACE", str(tmp_path))
     settings = _settings(tmp_path)
     ws = WorkspaceFactory.create_workspace(config=settings)
     ctx = getattr(ws, "_ownership", None)
@@ -204,6 +213,10 @@ def test_disabled_is_unfenced_across_all_surfaces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("ANTIGONA_OWNERSHIP_ENABLED", raising=False)
+    # The registry WRITE_FILE handler writes only inside the canonical workspace
+    # (A-CORE-001), so point ``ANTIGONA_WORKSPACE`` at the surface's root; this
+    # test measures "ownership OFF changes nothing", not path authorization.
+    monkeypatch.setenv("ANTIGONA_WORKSPACE", str(tmp_path))
     # WorkspaceFileTool
     backend = InProcessTestBackend(tmp_path / "w", test_mode=True, ownership=None)
     tool = WorkspaceFileTool(backend, ownership=None)

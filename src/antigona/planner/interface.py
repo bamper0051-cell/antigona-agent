@@ -15,6 +15,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from antigona.intent_router import IntentDecision
+from antigona.task_goal import WRITE_EFFECT_INTENTS, resolve_free_text_request
+
+#: Router intents for which the decision's entities ARE a contract: the intent
+#: itself names a workspace read/write tool, so a named path/content is the
+#: requested target. Every other intent (conversation, question, a typed tool
+#: such as mcp/email/TTS, ``task.code_change``) does NOT own a workspace write:
+#: its entities must never turn an effect-free request into a write. See FP-L05d
+#: and ``router/intent_router.py::_resolve_bare_verb_with_context``, which copies
+#: the PREVIOUS turn's entities into the decision (``last_entities``).
+ENTITY_CONTRACT_INTENTS = WRITE_EFFECT_INTENTS | {"task.file_read"}
 
 
 @dataclass
@@ -42,6 +52,12 @@ class PlanResult:
     steps: list[dict[str, Any]] = field(default_factory=list)
     requires_approval: bool = False
     error: str | None = None
+    #: True for a request that asks for NO side effect (conversation/answer, an
+    #: unresolvable shell command, a write with no derivable content). Such a
+    #: plan creates no flow and can never reach DONE.
+    answer_only: bool = False
+    #: Generic tool params (e.g. the ``answer_only`` marker).
+    params: dict[str, Any] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -100,12 +116,19 @@ class FlowEnginePlanner(PlannerInterface):
     async def _post_flow(
         self,
         goal: str,
-        path: str = "task_output.txt",
-        content: str = "",
-        tool_name: str = "workspace.write_text",
+        path: str | None = None,
+        content: str | None = None,
+        tool_name: str | None = None,
         command: list[str] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a flow on the Gateway. Wraps the legacy HTTP call."""
+        """Create a flow on the Gateway. Wraps the legacy HTTP call.
+
+        FP-L05d: the removed defaults (``path="task_output.txt"``,
+        ``tool_name="workspace.write_text"``) are gone. A caller that omits them
+        submits FREE TEXT and the Gateway resolves it
+        (``resolve_submit_contract``) instead of writing the request text.
+        """
         import time
 
         import httpx
@@ -113,16 +136,21 @@ class FlowEnginePlanner(PlannerInterface):
         headers = {"Authorization": f"Bearer {self.gateway_token}"}
         idempotency_key = f"flow-{int(time.time() * 1000)}"
         headers["Idempotency-Key"] = idempotency_key
+        payload: dict[str, Any] = {
+            "goal": goal,
+            "command": command or [],
+            "params": params or {},
+        }
+        if path is not None:
+            payload["path"] = path
+        if content is not None:
+            payload["content"] = content
+        if tool_name is not None:
+            payload["tool_name"] = tool_name
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{self.gateway_url}/flows",
-                json={
-                    "goal": goal,
-                    "path": path,
-                    "content": content,
-                    "tool_name": tool_name,
-                    "command": command or [],
-                },
+                json=payload,
                 headers=headers,
             )
             resp.raise_for_status()
@@ -131,36 +159,53 @@ class FlowEnginePlanner(PlannerInterface):
     async def plan(self, decision: IntentDecision, context: dict[str, Any] | None = None) -> PlanResult:
         """Convert an IntentDecision into a plan.
 
-        Resolves the tool name, path, command, and content from the decision.
-        Does NOT create the flow yet — execute() creates it.
+        Resolves the tool name, path, command, and content from the canonical
+        free-text request resolver (:func:`antigona.task_goal.
+        resolve_free_text_request`) — the SAME resolution ``POST /tasks`` uses.
+        The old ``content = goal`` default (which made every plan write its own
+        request text into a file, the P0 false-DONE machine) is gone: a plan
+        only carries content the request actually asked for.
         """
         goal = decision.entities.get("goal", "") or (context or {}).get("text", "")
-        path = decision.entities.get("path", "task_output.txt")
-        content = decision.entities.get("content", goal)
-        tool_name = "workspace.write_text"
-        command: list[str] = []
+        request = resolve_free_text_request(goal, decision=decision)
 
-        # Planner rule: system executables (for example git) must be installed by
-        # the sandbox OS package manager, never by pip. DockerShellTool applies
-        # the image-specific apk/apt-get mapping while retaining approval.
-        if decision.intent == "task.shell" or goal.startswith("shell:"):
-            tool_name = "sandbox.shell"
-            cmd_str = goal[6:].strip() if goal.startswith("shell:") else goal
-            # Prefer structured argv for simple commands.  Shell syntax is kept
-            # behind sh -c and is later subject to strict normalization only;
-            # this avoids creating a shell interpretation where none is needed.
-            import re
-            import shlex
-            if not re.search(r"[&|;<>$`\\]|\\n", cmd_str):
-                try:
-                    command = shlex.split(cmd_str)
-                except ValueError:
-                    command = ["sh", "-c", cmd_str]
-            else:
-                command = ["sh", "-c", cmd_str]
-            goal = f"Execute shell: {cmd_str}"
+        path = request.path
+        content: str = request.content or ""
+        tool_name = request.tool_name
+        answer_only = request.answer_only
+        command = list(request.command)
 
-        requires_approval = decision.requires_approval
+        # Explicit router entities are a stronger contract than text parsing —
+        # but ONLY for an intent that itself owns a workspace read/write tool.
+        # ``_resolve_bare_verb_with_context`` fills the decision with the
+        # PREVIOUS turn's entities (``last_entities``); letting those reopen a
+        # write cleared the resolver's ``answer_only`` and wrote a stale body
+        # for a request that asks for no effect at all (FP-L05d).
+        entity_path = str(decision.entities.get("path") or "")
+        entity_content = decision.entities.get("content")
+        entity_contract = decision.intent in ENTITY_CONTRACT_INTENTS
+        if decision.intent == "task.shell":
+            if command:
+                tool_name = "sandbox.shell"
+                answer_only = False
+        elif entity_contract and (entity_path or entity_content is not None):
+            tool_name = (
+                "workspace.read_text"
+                if decision.intent == "task.file_read"
+                else "workspace.write_text"
+            )
+            answer_only = False
+        if entity_contract:
+            if entity_path:
+                path = entity_path
+            if entity_content is not None:
+                content = str(entity_content)
+        if answer_only:
+            # An effect-free plan carries neither a file body nor a target.
+            content = ""
+            path = ""
+
+        requires_approval = request.requires_approval
 
         return PlanResult(
             goal=goal,
@@ -169,6 +214,8 @@ class FlowEnginePlanner(PlannerInterface):
             tool_name=tool_name,
             command=command,
             requires_approval=requires_approval,
+            answer_only=answer_only,
+            params={"answer_only": True} if answer_only else {},
             steps=[
                 {
                     "action": "create_flow",
@@ -192,6 +239,11 @@ class FlowEnginePlanner(PlannerInterface):
         """
         if plan.error:
             return plan
+        if plan.answer_only:
+            # Nothing to execute: a request that asks for no side effect must
+            # never create a flow. The caller reports the request as a
+            # conversation/answer, not as a completed task.
+            return plan
         try:
             flow_data = await self._post_flow(
                 goal=plan.goal,
@@ -199,6 +251,7 @@ class FlowEnginePlanner(PlannerInterface):
                 content=plan.content,
                 tool_name=plan.tool_name,
                 command=plan.command,
+                params=plan.params,
             )
             plan.flow_id = str(flow_data.get("id", ""))
             return plan

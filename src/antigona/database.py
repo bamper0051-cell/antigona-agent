@@ -21,7 +21,9 @@ from .observability import event as log_event
 #: existing databases remain covered by the replay-safe Alembic/runtime column upgrade.
 #: 10 = durable one-shot approval grants (``approvals.grant_token``).
 #: 11 = delivery_receipts table for durable crash-after-send idempotency (DELIV-01).
-SCHEMA_VERSION = 11
+#: 12 = delivery_receipts read-back: provider_message_id, read_back_status,
+#:      read_back_at (B53 / DELIV-02), all nullable so old rows stay valid.
+SCHEMA_VERSION = 12
 
 
 class Base(DeclarativeBase):
@@ -126,6 +128,7 @@ class Database:
         self._ensure_schema_v9()
         self._ensure_approval_grant_column()
         self._ensure_goal_autonomy_columns()
+        self._ensure_delivery_readback_columns()
         with self.engine.begin() as connection:
             connection.exec_driver_sql(
                 "CREATE TABLE IF NOT EXISTS schema_version "
@@ -287,6 +290,34 @@ class Database:
                 if name not in columns:
                     connection.exec_driver_sql(
                         f"ALTER TABLE goals ADD COLUMN {name} {declaration}"
+                    )
+
+    def _ensure_delivery_readback_columns(self) -> None:
+        """Replay-safe SQLite upgrade for delivery receipt read-back (v12 / B53).
+
+        SQLite's ``create_all`` cannot add columns to an existing table, so an
+        already-provisioned database needs an explicit ALTER. All three columns
+        are NULLABLE: existing receipt rows stay valid with no backfill, and the
+        replay-safe guard keeps the method idempotent on re-run.
+        """
+        if self.engine.dialect.name != "sqlite":
+            return
+        with self.engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql("PRAGMA table_info(delivery_receipts)")
+            }
+            if not columns:
+                return
+            additions = {
+                "provider_message_id": "VARCHAR(255)",
+                "read_back_status": "VARCHAR(16)",
+                "read_back_at": "DATETIME",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE delivery_receipts ADD COLUMN {name} {declaration}"
                     )
 
     def session(self) -> Generator[Session, None, None]:

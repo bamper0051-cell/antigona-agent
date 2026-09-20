@@ -1,7 +1,9 @@
 """Tests for compound shell command handling in DockerShellTool.
 
 RED→GREEN: compound commands with &&, >, |, ; must be wrapped in
-/bin/sh -c rather than shlex.split into argv tokens.
+/bin/sh -c rather than shlex.split into argv tokens.  FP-L03c extended that:
+EVERY packed command line (operator or not) is now handed to the container as
+``/bin/sh -c <line>``, so expansions and globs work too.
 """
 from __future__ import annotations
 
@@ -12,7 +14,12 @@ import pytest
 
 
 def _has_shell_operators(cmd: str) -> bool:
-    """Mirror the detection logic in shell.py."""
+    """Historical mirror of the operator sniffing REMOVED from shell.py.
+
+    ``shell.py`` no longer branches on operators (FP-L03c) — keeping the mirror
+    here documents the classification that produced the defect, so a future
+    "optimization" that re-introduces sniffing is recognisably a regression.
+    """
     return bool(re.search(r"&&|\|\||\||;|>>?(?!=)", cmd))
 
 
@@ -90,8 +97,13 @@ def test_compound_command_wrapped_in_sh_c() -> None:
         assert not standalone, f"Operators as standalone tokens: {standalone}"
 
 
-def test_simple_command_still_shlex_split() -> None:
-    """Simple commands (no shell operators) should still be shlex.split."""
+def test_simple_command_is_wrapped_in_sh_c() -> None:
+    """FP-L03c: even without shell operators, a packed line goes to /bin/sh -c.
+
+    Operator sniffing was the defect: ``echo $((2+2))`` and ``ls *.txt`` contain
+    no operator, so they were ``shlex.split`` into argv and the payload was then
+    re-quoted into a literal — expansions and globs silently stopped working.
+    """
     import tempfile
     import unittest.mock as mock
     from pathlib import Path
@@ -119,8 +131,7 @@ def test_simple_command_still_shlex_split() -> None:
 
         assert captured_argv
         docker_run_argv = captured_argv[0]
-        # Simple: shlex split, so "echo", "hello", "world" as separate tokens
-        assert "echo" in docker_run_argv
-        assert "hello" in docker_run_argv
-        assert "world" in docker_run_argv
-        assert "/bin/sh" not in docker_run_argv
+        # Packed line: the shell runs it, verbatim, as one argument.
+        assert docker_run_argv[-3:] == ["/bin/sh", "-c", "echo hello world"]
+        assert "echo" not in docker_run_argv
+        assert "hello world" not in docker_run_argv

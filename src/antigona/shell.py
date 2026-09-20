@@ -11,6 +11,7 @@ from .observability import event
 from .ownership.epoch import FenceDeniedError, OwnershipContext
 from .ownership.wiring import enforce_write_fence
 from .result_safety import sanitize_result_text
+from .sandbox.docker_sandbox import image_missing_message, image_missing_signal
 from .sandbox.runner import (
     DEFAULT_RUNTIME,
     SandboxIsolationError,
@@ -20,9 +21,11 @@ from .sandbox.runner import (
     resolve_workspace_uid_gid,
 )
 from .tools.shell_command import (
+    normalize_apt_sandbox_user,
     normalize_shell_command_first_token,
     normalize_system_package_install,
     strip_shell_tool_prefix_argv,
+    to_shell_argv,
 )
 
 
@@ -164,6 +167,14 @@ class DockerShellTool:
             output = sanitize_result_text(
                 logs_res.stdout or "",
                 max_length=self.output_cap,
+                # FP-L23R: the container's stdout IS the effect trace — its line
+                # structure must survive the tool boundary. Flattening it here
+                # (the historical default) glued a two-line ``ls | head -2``
+                # into one 72-character token that no later layer could
+                # un-flatten, so the durable artifact, the verifier and the
+                # owner all saw an opaque blob. Line breaks are not a secret;
+                # redaction and the output cap still apply.
+                preserve_newlines=True,
             )
             return ToolResult(True, "completed", {"output": output or ""})
         except FileNotFoundError:
@@ -217,33 +228,17 @@ class DockerShellTool:
         if _norm:
             _norm[0] = normalize_shell_command_first_token(str(_norm[0]))
         arguments = ShellInput(command=tuple(_norm), execution_id=arguments.execution_id)
-        # Normalize a single string argv (e.g. ``("echo WIP-SHELL-CHECK",)``)
-        # into a real argv list: LLM tool calls often pack the whole command
-        # line into one element, and docker would treat it as one binary.
-        # COMPOUND COMMANDS: if the string contains shell operators (&&, ||,
-        # |, >, >>, ;) we must NOT shlex.split — that turns operators into
-        # argv tokens.  Instead wrap as ``/bin/sh -c '<command>'`` so the
-        # container's shell interprets them.
-        if len(arguments.command) == 1 and " " in arguments.command[0].strip():
-            import re as _re
-            import shlex
-
-            cmd_str = arguments.command[0].strip()
-            if _re.search(r"&&|\|\||\||;|>>?(?!=)", cmd_str):
-                # Compound command: wrap in /bin/sh -c
-                arguments = ShellInput(
-                    command=("/bin/sh", "-c", cmd_str),
-                    execution_id=arguments.execution_id,
-                )
-            else:
-                try:
-                    parts = shlex.split(cmd_str)
-                except ValueError:
-                    parts = []
-                if parts:
-                    arguments = ShellInput(
-                        command=tuple(parts), execution_id=arguments.execution_id,
-                    )
+        # FP-L03c: a SINGLE packed element is the container shell's command
+        # LINE, not an argv.  It is therefore ALWAYS executed as
+        # ``/bin/sh -c <line>`` — no operator sniffing, no ``shlex.split``, no
+        # re-quoting — so ``$VAR``, ``$((...))``, globs, substitutions,
+        # redirections and ``sh`` aliases behave as the user expects inside the
+        # container.  A real argv (several elements) is passed through exactly
+        # as the caller gave it.
+        arguments = ShellInput(
+            command=to_shell_argv(arguments.command),
+            execution_id=arguments.execution_id,
+        )
         arguments = ShellInput(command=normalize_system_package_install(arguments.command, alpine="alpine" in self.image.lower()), execution_id=arguments.execution_id)
         # apt/apt-get under --cap-drop=ALL cannot drop to its "_apt" sandbox
         # user (no CAP_SETGID/SETUID on arbitrary targets after drop) and the
@@ -252,12 +247,13 @@ class DockerShellTool:
         # sandbox lets it run as the container user (root, with DAC_OVERRIDE)
         # which can write /var/lib/apt. Safe in a throwaway, non-privileged
         # container. Only touched for apt/apt-get; everything else is untouched.
-        if arguments.command and arguments.command[0] in ("apt", "apt-get"):
-            arguments = ShellInput(
-                command=tuple([arguments.command[0], "-o", "APT::Sandbox::User=root"])
-                + tuple(arguments.command[1:]),
-                execution_id=arguments.execution_id,
-            )
+        # FP-L03c: an ``apt`` command packed into one element is now a shell
+        # LINE, so the flag is inserted into the line itself — the workaround
+        # must survive the switch to ``/bin/sh -c``.
+        arguments = ShellInput(
+            command=normalize_apt_sandbox_user(arguments.command),
+            execution_id=arguments.execution_id,
+        )
         try:
             if self._size() > self.max_workspace_bytes:
                 return self._failure("workspace quota exceeded")
@@ -312,6 +308,35 @@ class DockerShellTool:
             return self._failure("workspace unavailable")
         if returncode != 0:
             raw_err = _stderr.decode(errors="replace")
+            # F-20260919T0230Z: docker exits 125 when the image is absent and its
+            # automatic pull was refused by the sandbox socket proxy (by design).
+            # That raw docker text must NOT be surfaced as the task answer; name
+            # the image and the remedy instead.  Narrow: 125 + a specific marker
+            # only — a genuine command failure keeps its real output below.
+            if image_missing_signal(returncode, raw_err):
+                event(
+                    "sandbox_image_missing",
+                    service="sandbox",
+                    correlation_id=None,
+                    status="blocked",
+                    image=self.image,
+                    exit_code=returncode,
+                    reason=(
+                        "docker run exit 125 with an image-missing/refused-pull "
+                        "stderr; the socket proxy refuses pulls by design"
+                    ),
+                )
+                return ToolResult(
+                    False,
+                    "failed",
+                    error=image_missing_message(self.image),
+                    retryable=False,
+                    evidence=[
+                        Evidence("returncode", str(returncode)),
+                        Evidence("diagnostic", "sandbox_image_missing"),
+                        Evidence("image", self.image),
+                    ],
+                )
             text = raw_err.lower()
             diagnostic = (
                 "command_not_found"
@@ -365,5 +390,16 @@ class DockerShellTool:
         output = sanitize_result_text(
             stdout.decode(errors="replace"),
             max_length=self.output_cap,
+            # FP-L23R (root cause): the shell tool was the FIRST lossy layer.
+            # ``sanitize_result_text`` defaults to ``preserve_newlines=False``,
+            # so the real stdout lost its lines here — before
+            # ``project_tool_result``, before ``_materialize_stdout_artifact``
+            # and before the verifier. The FP-L23 fix downstream was therefore
+            # dead on the live path: it faithfully re-sanitized an
+            # already-glued string. Keeping the line structure here is safe
+            # (a newline is not a secret; redaction + the output cap are
+            # unchanged) and is what makes the artifact, the judge's effect
+            # facts and the owner's message faithful again.
+            preserve_newlines=True,
         )
         return ToolResult(True, "completed", {"output": output or ""})

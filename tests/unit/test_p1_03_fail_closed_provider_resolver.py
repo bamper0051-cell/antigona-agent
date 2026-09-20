@@ -36,6 +36,7 @@ _ENV_KEYS = (
     "ANTIGONA_PROVIDER",
     "ACTIVE_PROVIDER",
     "PROVIDER_BASE_URL",
+    "SILICONFLOW_API_KEY",
     "DEEPSEEK_API_KEY",
     "OPENROUTER_API_KEY",
     "ANTIGONA_OPENROUTER_API_KEY",
@@ -168,3 +169,24 @@ def test_explicit_provider_with_valid_key_resolves_correctly(
     assert "openrouter.ai" in base_url
     assert api_key == "sk-openrouter-valid"
     assert model == "openai/gpt-4o-mini"
+
+
+def test_explicit_siliconflow_uses_public_endpoint_and_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit SiliconFlow selection preserves its public endpoint and model."""
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "«redacted:sk-…»")
+    monkeypatch.setenv("PROVIDER_BASE_URL", "https://api.siliconflow.com/v1/")
+    monkeypatch.setenv("ANTIGONA_MODEL", "Qwen/Qwen2.5-72B")
+    _save_state("siliconflow", "")
+
+    provider = get_default_provider()
+    assert provider is not None
+    assert provider._base_url == "https://api.siliconflow.com/v1"
+    assert provider._model == "Qwen/Qwen2.5-72B"
+
+    info = ProviderResolver.get_active_info()
+    assert info.status == "active"
+    assert info.provider_name == "siliconflow"
+    assert info.base_url == "https://api.siliconflow.com/v1"
+    assert info.model_name == "Qwen/Qwen2.5-72B"

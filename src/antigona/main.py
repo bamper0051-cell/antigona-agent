@@ -57,10 +57,20 @@ def create_app(settings: Settings|None=None)->FastAPI:
     def health()->dict[str,str]: return {"status":"ok","sandbox":resolved.sandbox_backend}
     @app.post("/tasks",response_model=TaskView,status_code=201)
     def create_task(body:TaskCreate,response:Response,idempotency_key:Annotated[str,Header(min_length=1,alias="Idempotency-Key")],owner_id:Annotated[str,Depends(owner)],session:Annotated[Session,Depends(get_session)])->TaskView:
-        try: validate_relative_path(resolved.workspace,body.path)
+        # FP-L05d: same contract as the canonical Gateway — a submit that names
+        # no tool and no body of its own is FREE TEXT and is resolved by the
+        # canonical goal resolver, never submitted as a write of its own text.
+        from .task_goal import resolve_submit_contract
+        contract=resolve_submit_contract(body.goal,tool_name=body.tool_name,path=body.path,content=body.content,command=tuple(body.command))
+        tool_name=contract.tool_name; path=contract.path or body.path or "task_output.txt"
+        content=contract.content if contract.content is not None else ""
+        command=tuple(body.command) or contract.command
+        params=dict(body.params)
+        if contract.answer_only: params["answer_only"]=True
+        try: validate_relative_path(resolved.workspace,path)
         except WorkspaceViolation as exc: raise HTTPException(422,str(exc)) from exc
-        if body.tool_name=="sandbox.shell" and not body.command: raise HTTPException(422,"shell command is required")
-        try: task,created=TaskRepository(session).create(CreateTask(owner_id,body.goal,body.path,body.content,idempotency_key,body.tool_name,tuple(body.command)))
+        if tool_name=="sandbox.shell" and not command: raise HTTPException(422,"shell command is required")
+        try: task,created=TaskRepository(session).create(CreateTask(owner_id,body.goal,path,content,idempotency_key,tool_name,command,params=params))
         except IdempotencyConflict as exc: raise HTTPException(409,str(exc)) from exc
         if not created: response.status_code=200
         if created: DurableQueue(session).enqueue(task)

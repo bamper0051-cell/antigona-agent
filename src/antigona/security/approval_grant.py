@@ -18,6 +18,19 @@ Only the SHA-256 of the token is persisted; the raw token is returned to the
 caller exactly once and never lands in the database or in the audit log. The
 audit trail carries ``grant_id`` (``token_hash[:16]``) only.
 
+Two verification surfaces exist and must never be confused:
+
+* :meth:`ApprovalGrantStore.verify` / :meth:`ApprovalGrantStore.verify_and_consume`
+  take the RAW token returned by :meth:`ApprovalGrantStore.issue`. The only key
+  they ever look up is ``sha256(raw_token)``; presenting the persisted digest as
+  if it were a token is refused with ``NOT_FOUND``.
+* :meth:`ApprovalGrantStore.verify_stored` /
+  :meth:`ApprovalGrantStore.verify_and_consume_stored` take the persisted primary
+  key (the ``approval_grants.token_hash`` column) verbatim, never hashed. They
+  exist only for the durable owner-approval path, where the raw token was
+  deliberately not retained; every external surface must use the raw-token
+  methods above.
+
 Every verification failure is fail-closed: any internal error yields an invalid
 verdict (``STORE_ERROR``), never an allow.
 """
@@ -61,6 +74,21 @@ def compute_args_digest(tool_name: str, params: Mapping[str, Any]) -> str:
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+_HEX_DIGEST_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_persisted_key(value: object) -> bool:
+    """True iff ``value`` is a 64-char lowercase hex digest.
+
+    That is exactly the form :meth:`ApprovalGrantStore.issue` writes into the
+    ``approval_grants.token_hash`` primary key. Anything else fails closed when
+    presented to the stored-key surface.
+    """
+    if not isinstance(value, str):
+        return False
+    return len(value) == 64 and all(ch in _HEX_DIGEST_CHARS for ch in value)
 
 
 class GrantDenialReason(StrEnum):
@@ -325,6 +353,73 @@ class ApprovalGrantStore:
             return GrantDenialReason.ARGS_MISMATCH
         return None
 
+    def _verify_key(
+        self,
+        token_hash: str,
+        *,
+        actor: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        now: float,
+    ) -> GrantVerdict:
+        """Look ``token_hash`` up verbatim and check its bindings (no consume)."""
+        try:
+            with self._connection() as conn:
+                grant = self._load(conn, token_hash)
+        except Exception:
+            logger.exception("Approval grant lookup failed (fail-closed)")
+            return GrantVerdict(valid=False, reason=GrantDenialReason.STORE_ERROR)
+        if grant is None:
+            return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
+        violation = self._check_binding(
+            grant, actor=actor, tool_name=tool_name, args=args, now=now
+        )
+        if violation is not None:
+            return GrantVerdict(valid=False, reason=violation, grant_id=grant.grant_id)
+        return GrantVerdict(valid=True, grant_id=grant.grant_id)
+
+    def _consume_key(
+        self,
+        token_hash: str,
+        *,
+        actor: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        consumed_by: str,
+        now: float,
+    ) -> GrantVerdict:
+        """Look ``token_hash`` up verbatim, check bindings and consume (CAS)."""
+        try:
+            with self._connection() as conn:
+                grant = self._load(conn, token_hash)
+                if grant is None:
+                    return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
+                violation = self._check_binding(
+                    grant, actor=actor, tool_name=tool_name, args=args, now=now
+                )
+                if violation is not None:
+                    return GrantVerdict(
+                        valid=False, reason=violation, grant_id=grant.grant_id
+                    )
+                if not grant.one_shot:
+                    return GrantVerdict(valid=True, grant_id=grant.grant_id)
+                cur = conn.execute(
+                    "UPDATE approval_grants SET consumed_at = ?, consumed_by = ? "
+                    "WHERE token_hash = ? AND consumed_at IS NULL",
+                    (now, str(consumed_by), token_hash),
+                )
+                if cur.rowcount != 1:
+                    # Lost the race: another dispatch consumed this grant.
+                    return GrantVerdict(
+                        valid=False,
+                        reason=GrantDenialReason.CONSUMED,
+                        grant_id=grant.grant_id,
+                    )
+                return GrantVerdict(valid=True, grant_id=grant.grant_id)
+        except Exception:
+            logger.exception("Approval grant consumption failed (fail-closed)")
+            return GrantVerdict(valid=False, reason=GrantDenialReason.STORE_ERROR)
+
     def verify(
         self,
         token: str,
@@ -334,31 +429,53 @@ class ApprovalGrantStore:
         args: Mapping[str, Any],
         now: float | None = None,
     ) -> GrantVerdict:
-        """Check a grant without consuming it."""
+        """Check a RAW grant token without consuming it.
+
+        ``token`` is the token returned by :meth:`issue`. The only key looked up
+        is ``sha256(token)``; the persisted digest of a grant is NOT a token and
+        yields ``NOT_FOUND``.
+        """
         checked_at = time.time() if now is None else now
         if not token.strip():
             return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
-        token_clean = token.strip()
-        token_hash = _hash_token(token_clean)
-        try:
-            with self._connection() as conn:
-                grant = self._load(conn, token_hash)
-                if grant is None:
-                    grant = self._load(conn, token_clean)
-                    if grant is not None:
-                        token_hash = token_clean
-        except Exception:
-            logger.exception("Approval grant lookup failed (fail-closed)")
-            return GrantVerdict(valid=False, reason=GrantDenialReason.STORE_ERROR)
-
-        if grant is None:
-            return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
-        violation = self._check_binding(
-            grant, actor=actor, tool_name=tool_name, args=args, now=checked_at
+        return self._verify_key(
+            _hash_token(token.strip()),
+            actor=actor,
+            tool_name=tool_name,
+            args=args,
+            now=checked_at,
         )
-        if violation is not None:
-            return GrantVerdict(valid=False, reason=violation, grant_id=grant.grant_id)
-        return GrantVerdict(valid=True, grant_id=grant.grant_id)
+
+    def verify_stored(
+        self,
+        token_hash: str,
+        *,
+        actor: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        now: float | None = None,
+    ) -> GrantVerdict:
+        """Check a grant by its PERSISTED primary key (looked up verbatim).
+
+        ``token_hash`` is the persisted primary key — the value of the
+        ``approval_grants.token_hash`` column as written by :meth:`issue` — and
+        is looked up verbatim, never hashed. It is the persisted primary key;
+        ONLY the durable owner-approval path (where the raw token was
+        deliberately not retained) may use this; every external surface must
+        call :meth:`verify` with the RAW token. Anything that is not a 64-char
+        lowercase hex digest fails closed with ``NOT_FOUND``, never an
+        exception.
+        """
+        checked_at = time.time() if now is None else now
+        if not _is_persisted_key(token_hash):
+            return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
+        return self._verify_key(
+            token_hash,
+            actor=actor,
+            tool_name=tool_name,
+            args=args,
+            now=checked_at,
+        )
 
     def verify_and_consume(
         self,
@@ -370,7 +487,11 @@ class ApprovalGrantStore:
         consumed_by: str = "",
         now: float | None = None,
     ) -> GrantVerdict:
-        """Check a grant and atomically consume it when it is one-shot.
+        """Check a RAW grant token and atomically consume it when one-shot.
+
+        ``token`` is the token returned by :meth:`issue`. The only key looked up
+        is ``sha256(token)``; the persisted digest of a grant is NOT a token and
+        yields ``NOT_FOUND``.
 
         The consumption is a compare-and-set (``WHERE consumed_at IS NULL``)
         so two concurrent dispatches of the same token yield exactly one
@@ -379,40 +500,47 @@ class ApprovalGrantStore:
         checked_at = time.time() if now is None else now
         if not token.strip():
             return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
-        token_clean = token.strip()
-        token_hash = _hash_token(token_clean)
-        try:
-            with self._connection() as conn:
-                grant = self._load(conn, token_hash)
-                if grant is None:
-                    grant = self._load(conn, token_clean)
-                    if grant is not None:
-                        token_hash = token_clean
-                if grant is None:
-                    return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
-                violation = self._check_binding(
-                    grant, actor=actor, tool_name=tool_name, args=args, now=checked_at
-                )
-                if violation is not None:
-                    return GrantVerdict(valid=False, reason=violation, grant_id=grant.grant_id)
-                if not grant.one_shot:
-                    return GrantVerdict(valid=True, grant_id=grant.grant_id)
-                cur = conn.execute(
-                    "UPDATE approval_grants SET consumed_at = ?, consumed_by = ? "
-                    "WHERE token_hash = ? AND consumed_at IS NULL",
-                    (checked_at, str(consumed_by), token_hash),
-                )
-                if cur.rowcount != 1:
-                    # Lost the race: another dispatch consumed this grant.
-                    return GrantVerdict(
-                        valid=False,
-                        reason=GrantDenialReason.CONSUMED,
-                        grant_id=grant.grant_id,
-                    )
-        except Exception:
-            logger.exception("Approval grant consumption failed (fail-closed)")
-            return GrantVerdict(valid=False, reason=GrantDenialReason.STORE_ERROR)
-        return GrantVerdict(valid=True, grant_id=grant.grant_id)
+        return self._consume_key(
+            _hash_token(token.strip()),
+            actor=actor,
+            tool_name=tool_name,
+            args=args,
+            consumed_by=consumed_by,
+            now=checked_at,
+        )
+
+    def verify_and_consume_stored(
+        self,
+        token_hash: str,
+        *,
+        actor: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        consumed_by: str = "",
+        now: float | None = None,
+    ) -> GrantVerdict:
+        """Check-and-consume a grant by its PERSISTED primary key (verbatim).
+
+        ``token_hash`` is the persisted primary key — the value of the
+        ``approval_grants.token_hash`` column as written by :meth:`issue` — and
+        is looked up verbatim, never hashed. It is the persisted primary key;
+        ONLY the durable owner-approval path (where the raw token was
+        deliberately not retained) may use this; every external surface must
+        call :meth:`verify_and_consume` with the RAW token. Anything that is not
+        a 64-char lowercase hex digest fails closed with ``NOT_FOUND``, never an
+        exception.
+        """
+        checked_at = time.time() if now is None else now
+        if not _is_persisted_key(token_hash):
+            return GrantVerdict(valid=False, reason=GrantDenialReason.NOT_FOUND)
+        return self._consume_key(
+            token_hash,
+            actor=actor,
+            tool_name=tool_name,
+            args=args,
+            consumed_by=consumed_by,
+            now=checked_at,
+        )
 
     # ── Housekeeping ───────────────────────────────────────────────────────
 

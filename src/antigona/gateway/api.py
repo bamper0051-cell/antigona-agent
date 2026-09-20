@@ -84,7 +84,11 @@ from ..schemas import (
     VerifiedArtifactResultView,
 )
 from ..skills import SkillsRegistry
-from ..task_goal import requires_exact_write_read_contract
+from ..task_goal import (
+    requires_exact_write_read_contract,
+    resolve_free_text_request,
+    resolve_submit_contract,
+)
 from .correlation import CORRELATION_HEADER, ensure_correlation_id, log_event
 
 TERMINAL_STATES = {
@@ -542,9 +546,33 @@ def create_gateway_app(settings: Settings | None = None) -> FastAPI:
         session: Annotated[Session, Depends(get_session)],
         correlation_id: Annotated[str, Depends(correlation)],
     ) -> TaskView:
-        if body.tool_name == "sandbox.shell" and not body.command:
+        """Create a flow from a structured OR free-text contract (FP-L05d).
+
+        The caller may name the tool and the body explicitly (that contract is
+        honoured verbatim). A caller that names neither is submitting FREE TEXT:
+        the tool, target, body and argv come from the canonical goal resolver —
+        the same resolution ``POST /tasks``, the brain and the planner use. The
+        removed preset (``workspace.write_text`` + ``task_output.txt`` + the
+        request text as the body) is what turned this endpoint into a
+        write-your-own-text machine.
+        """
+        contract = resolve_submit_contract(
+            body.goal,
+            tool_name=body.tool_name,
+            path=body.path,
+            content=body.content,
+            command=tuple(body.command),
+        )
+        tool_name = contract.tool_name
+        resolved_path = contract.path or body.path
+        resolved_content = contract.content if contract.content is not None else ""
+        command = tuple(body.command) or contract.command
+        params = dict(body.params)
+        if contract.answer_only:
+            params["answer_only"] = True
+        if tool_name == "sandbox.shell" and not command:
             raise HTTPException(422, "shell command is required")
-        if body.tool_name == "mcp" and not (body.mcp_server and body.mcp_tool):
+        if tool_name == "mcp" and not (body.mcp_server and body.mcp_tool):
             raise HTTPException(422, "mcp_server and mcp_tool are required for mcp tasks")
         service = TaskSubmissionService(database)
         try:
@@ -552,10 +580,10 @@ def create_gateway_app(settings: Settings | None = None) -> FastAPI:
                 owner_id=owner_id,
                 message=body.goal,
                 idempotency_key=idempotency_key,
-                tool_name=body.tool_name,
-                path=body.path,
-                command=tuple(body.command),
-                content=body.content,
+                tool_name=tool_name,
+                path=resolved_path,
+                command=command,
+                content=resolved_content,
                 read_after_write=body.read_after_write,
                 run_after_write=body.run_after_write,
                 run_command=tuple(body.run_command),
@@ -565,7 +593,7 @@ def create_gateway_app(settings: Settings | None = None) -> FastAPI:
                 mcp_server=body.mcp_server,
                 mcp_tool=body.mcp_tool,
                 mcp_arguments=body.mcp_arguments,
-                params=body.params,
+                params=params,
                 correlation_id=correlation_id,
                 client="api",
             )
@@ -587,17 +615,30 @@ def create_gateway_app(settings: Settings | None = None) -> FastAPI:
         correlation_id: Annotated[str, Depends(correlation)],
     ) -> TaskView:
         """Submit a free-text task. The message is used as the task goal.
+
         Thin adapter over the single TaskSubmissionService — the same service
-        AntigonaBrain and POST /flows use (no separate orchestration path)."""
+        AntigonaBrain and POST /flows use (no separate orchestration path).
+
+        P0 false-DONE machine: the request is resolved by the CANONICAL goal
+        parse (``resolve_free_text_request`` → ``parse_goal`` + IntentRouter),
+        never by a hard-coded ``workspace.write_text`` +
+        ``task_output.txt`` default. A message that asks for no side effect
+        (conversation/answer, an unresolvable shell command, a write whose
+        content cannot be derived) is submitted as an effect-free task: it
+        never writes a file of its own text and can never reach DONE.
+        """
+        request = resolve_free_text_request(body.message)
         service = TaskSubmissionService(database)
         try:
             result = service.submit(
                 owner_id=owner_id,
                 message=body.message,
                 idempotency_key=idempotency_key,
-                tool_name="workspace.write_text",
-                path="task_output.txt",
-                command=(),
+                tool_name=request.tool_name,
+                path=request.path,
+                command=request.command,
+                content=request.content,
+                params={"answer_only": True} if request.answer_only else {},
                 correlation_id=correlation_id,
                 client="api",
             )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -130,17 +131,38 @@ def test_arch_guard_passes_with_baseline():
     assert r.returncode == 0, f"arch_guard failed:\n{r.stdout}\n{r.stderr}"
 
 
-def test_arch_guard_fails_on_new_violation(tmp_path):
-    """Добавление нового Path.home() вне core/paths.py -> guard exit != 0."""
+def _make_guard_sandbox(dest: Path) -> Path:
+    """Minimal out-of-tree copy of the tree ``arch_guard.py`` scans (F-20260918T2118Z)."""
     root = _repo_root()
-    src = root / "src" / "antigona"
-    probe = src / "_arch_probe_tmp.py"
+    (dest / "scripts").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / "scripts" / "arch_guard.py", dest / "scripts" / "arch_guard.py")
+    shutil.copy2(root / "scripts" / "arch_baseline.txt", dest / "scripts" / "arch_baseline.txt")
+    shutil.copytree(
+        root / "src" / "antigona",
+        dest / "src" / "antigona",
+        ignore=shutil.ignore_patterns("__pycache__"),
+        dirs_exist_ok=True,
+    )
+    return dest
+
+
+def test_arch_guard_fails_on_new_violation(tmp_path):
+    """Добавление нового Path.home() вне core/paths.py -> guard exit != 0.
+
+    Проба пишется в sandbox ВНЕ репозитория (F-20260918T2118Z): замороженное
+    дерево не должно содержать посторонний deployment-файл ни на мгновение
+    (C11 startup gate fail-closed на unknown deployment file).
+    """
+    root = _repo_root()
+    sandbox = _make_guard_sandbox(tmp_path / "guard_sandbox")
+    probe = sandbox / "src" / "antigona" / "_arch_probe_tmp.py"
+    assert not probe.is_relative_to(root), "probe must never be written inside the repository"
     probe.write_text("from pathlib import Path\nBAD = Path.home()\n", encoding="utf-8")
     try:
         r = subprocess.run(
-            [sys.executable, str(root / "scripts" / "arch_guard.py"),
-             "--baseline", str(root / "scripts" / "arch_baseline.txt")],
-            cwd=str(root), capture_output=True, text=True,
+            [sys.executable, str(sandbox / "scripts" / "arch_guard.py"),
+             "--baseline", str(sandbox / "scripts" / "arch_baseline.txt")],
+            cwd=str(sandbox), capture_output=True, text=True,
         )
         assert r.returncode != 0
         assert "_arch_probe_tmp.py" in r.stdout

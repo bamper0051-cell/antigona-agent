@@ -36,3 +36,20 @@ cli_aliases.json
 cli_theme.json
 cli_user_themes.json
 legacy_reachability.jsonl
+
+# Runtime state written into the code root when ANTIGONA_STATE_ROOT is unset.
+# Measured 2026-09-17 on a real published clone: one gateway run left these
+# untracked inside the code root, while antigona_sessions.db (line 24) and
+# .memory/ (line 13) were already ignored. Dev defaults resolve to the code root
+# via core.paths (project_local_dir() = project_root()/".antigona", lines 85-87;
+# sandbox_isolation.json line 330, provider_state.json line 340). Only these
+# untracked runtime files are ignored. .antigona/gateway_config.json is
+# deliberately NOT listed: it is tracked in the index, and git never applies
+# ignore rules to tracked files, so an ignore entry for it would protect nothing
+# while falsely implying the tracked file could be dropped (regression-guarded
+# by tests/unit/test_gitignore_tracked_paths.py). Tracked .antigona/ content
+# (e.g. .antigona/personalities/*.md) stays tracked.
+antigona_sessions.db-wal
+antigona_sessions.db-shm
+.antigona/sandbox_isolation.json
+.antigona/provider_state.json

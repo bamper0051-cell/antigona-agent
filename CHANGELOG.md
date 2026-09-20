@@ -65,6 +65,16 @@ runtime сообщают один и тот же номер `1.0.0`. Загол�
 
 ### Changed
 
+- **Loopback-дефолт для legacy `antigona-api` + owner-гейт на исполнители кода.**
+  Поведенческое изменение: `run_server()` и `--host` теперь по умолчанию
+  биндятся на `127.0.0.1`, а не на `0.0.0.0`; явный `--host 0.0.0.0` сохранён
+  как осознанный opt-in (AUDIT-C02/S4). В том же файле `GET /api/model/options`,
+  `POST /v1/chat/completions` и JSON-RPC `execute_tool` стали owner-scoped
+  (`Depends(_require_owner)` / dev-token-credential; `GET /health` намеренно
+  остаётся открыт для liveness). В реестре инструментов `frontend_build`,
+  `mcp add`/`call` и `acp add`/`remove` теперь требуют one-shot approval-грант,
+  как `run_shell`/`tmux`; read-only действия (`mcp list`, `acp list`) и обычные
+  read-only инструменты остаются без гранта (AUDIT-C12, шаги A–D).
 - **Единый chokepoint инструментов и fail-closed диспетчеризация** — `4d9184a`,
   `53396c5` (волны 4a/4b): диспетчеризация `ToolRegistry` закрыта, `run_shell`
   получил approval-гейт, host-fallback удалён.

@@ -21,9 +21,18 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from .tools.shell_command import strip_shell_tool_prefix
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps task_goal import-light
+    from antigona.router.intent_router import IntentDecision
+
+#: Tool marker for a request that asks for NO side effect (conversation, an
+#: answer, or an action whose effect cannot be materialized faithfully). Such a
+#: task must never write an artifact and must never reach DONE — it is how the
+#: P0 "false DONE machine" is kept closed.
+ANSWER_ONLY_TOOL = "answer_only"
 
 # ── Intent classification ────────────────────────────────────────────────
 
@@ -34,14 +43,23 @@ _SHELL_VERBS = (
 )
 
 _SHELL_CMD_RE = [
-    # «Выполни команду cat /etc/passwd» / «выполни команду: …»
+    # «Выполни команду cat /etc/passwd» / «выполни команду: …» /
+    # «запусти в оболочке команду ls …» / «выполни в оболочке pwd …»
+    # The "в оболочке / через оболочку" filler is instruction wording, not part
+    # of the command: without it the live goals fell through to the dialogue
+    # branch and were written to task_output.txt as their own file body.
     re.compile(
-        r"(?:выполни|выполнить|запусти|исполни)\s+команд[уы]?\s*:?\s*(.+)",
+        r"(?:выполни|выполнить|запусти|исполни)\s+"
+        r"(?:в\s+оболочке\s+|в\s+шелле\s+|через\s+оболочку\s+)?"
+        r"команд[уы]?\s*:?\s*(.+)",
         re.IGNORECASE,
     ),
-    # «Выполни echo hello» / «Выполни cat file» / «запусти pwd»
+    # «Выполни echo hello» / «Выполни cat file» / «запусти pwd» /
+    # «запусти в оболочке ls»
     re.compile(
-        r"(?:выполни|запусти|исполни)\s+(" + "|".join(_SHELL_VERBS) + r")\s*(.*)",
+        r"(?:выполни|запусти|исполни)\s+"
+        r"(?:в\s+оболочке\s+|в\s+шелле\s+|через\s+оболочку\s+)?"
+        r"(" + "|".join(_SHELL_VERBS) + r")\s*(.*)",
         re.IGNORECASE,
     ),
     # «shell: echo hello», «bash: ...», «sh: ...», «execute: ...»
@@ -226,6 +244,41 @@ _LINE_COUNT_DESC_RE = re.compile(
 )
 _CONTENT_REPORT_RE = re.compile(
     r"создай\s+отчёт\s+[\w.\-]+\s*:\s*(.+)", re.IGNORECASE
+)
+
+# FP-L05g: the cue word that introduces the BODY of a named write. The
+# «с текстом/содержимым X» shape was the only one the patterns above knew, so
+# the live Telegram request «запиши файл live_regression_probe.txt со словом
+# regression» produced content="" → the write degraded to answer_only (task
+# 3eff1a86 FAILED, no file anywhere) AND the already-extracted file name was
+# dropped (path="stdout"). A named write with an explicit body must never
+# degrade; the cue list below covers the natural formulations.
+_CONTENT_CUE_WORD = (
+    r"(?:слов(?:ом|о|а)\b|текст(?:ом|а|е)?\b|содержим(?:ым|ое|ого)\b|"
+    r"надпис(?:ью|ь|и)\b|значени(?:ем|е)\b|строчк(?:ой|у)\b|"
+    r"word|text|content)"
+)
+_CONTENT_CUE_RE = re.compile(
+    r"^(?:с\s+|со\s+)?(?:строго\s*:?\s*)?" + _CONTENT_CUE_WORD + r"\s*:?\s*",
+    re.IGNORECASE,
+)
+
+#: A file name token (quoted, slash-scoped with spaces, or a single word).
+_PATH_TOKEN = (
+    r"(?:\"[^\"]+\"|'[^']+'|[\w.\-/]+(?:/[\w.\-]+(?:[ \t]+[\w.\-/]+)*)|[\w.\-/]+)"
+)
+
+#: «<write verb> [в] [файл] <path> [в <folder>] <tail>» — the body of a named
+#: write. Used only as the LAST resort of ``_extract_content``: every shape
+#: above (JSON, two-lines, «с текстом X», «туда X») wins first.
+_CONTENT_AFTER_NAMED_PATH_RE = re.compile(
+    r"(?:созда(?:й|йте|ть)|create|запиш(?:и|ите|ем|ете)|записать|write|"
+    r"напиш(?:и|ите)|написать|сохрани(?:ть)?|save)\s+"
+    r"(?P<prep>в\s+файл\s+|файл\s+|file\s+|в\s+)?"
+    r"(?P<path>" + _PATH_TOKEN + r")\s+"
+    r"(?:в\s+\S+\s+)?"
+    r"(?P<tail>.+)",
+    re.IGNORECASE,
 )
 
 _MULTI_VALUES_RE = re.compile(r"со\s+значениями\s+(.+)", re.IGNORECASE)
@@ -710,16 +763,74 @@ def _extract_content(goal: str) -> str:
         # «с содержимым: X» — срезать ведущие ':' / '—' / пробелы, оставить X.
         content = content.lstrip(":—–- \t")
         # «с одной строкой: X» → содержимое X (дескриптор одной строки не содержимое).
-        return _LINE_COUNT_DESC_RE.sub("", content, count=1)
+        content = _LINE_COUNT_DESC_RE.sub("", content, count=1)
+        # FP-L05g: this branch's cue group is OPTIONAL, so «с надписью SIGN»
+        # captured "надписью SIGN" and «с текстом» (no body) captured the cue
+        # word itself as the body. Drop a leading cue word; an empty remainder
+        # means the text states no body at all (fail closed, no invented file).
+        return _strip_leading_content_cue(content)
     with_en = _CONTENT_WITH_EN_RE.search(goal)
     if with_en:
         content = _cut_sentence(with_en.group(1))
         content = content.lstrip(":—–- \t")
-        return _LINE_COUNT_DESC_RE.sub("", content, count=1)
+        content = _LINE_COUNT_DESC_RE.sub("", content, count=1)
+        return _strip_leading_content_cue(content)
     report = _CONTENT_REPORT_RE.search(goal)
     if report:
         return _cut_sentence(report.group(1))
-    return ""
+    # FP-L05g (last resort): «<write verb> [в] файл <name> [с] словом|текстом|
+    # содержимым|надписью <body>» and «напиши в файл <name> <literal>».
+    return _content_after_named_path(goal)
+
+
+def _strip_leading_content_cue(content: str) -> str:
+    """Drop a leading cue word («словом», «с текстом», «надписью», …).
+
+    FP-L05g. The cue is instruction, never content: «создай a.txt с надписью
+    SIGN» has the body ``SIGN``. Returns "" when nothing but the cue word was
+    present — the body is then not derivable and the write must fail closed.
+    """
+    stripped = _CONTENT_CUE_RE.sub("", content, count=1)
+    if stripped == content:
+        return content.strip()
+    return stripped.lstrip(":—–- \t")
+
+
+def _content_after_named_path(goal: str) -> str:
+    """Return the literal body of a named write, else "" (fail closed).
+
+    FP-L05g. Two shapes are accepted:
+
+    * a cue word introduces the body — «со словом X», «словом X», «с текстом
+      X», «текстом X», «с содержимым X», «с надписью X» (the cue word itself is
+      instruction, never content);
+    * «напиши в файл <name> X» — the body follows the named file directly, with
+      no cue word. Here only a bare literal counts (a single token or a quoted
+      string): «запиши в файл date.txt текущую дату» describes the body instead
+      of stating it and must stay answer_only, exactly as before.
+
+    The pattern is anchored on a write verb AND a name, so a phrase without a
+    named file never matches a body here.
+    """
+    match = _CONTENT_AFTER_NAMED_PATH_RE.search(goal)
+    if not match:
+        return ""
+    prep = (match.group("prep") or "").strip().casefold()
+    tail = match.group("tail").strip()
+    stripped = _CONTENT_CUE_RE.sub("", tail, count=1)
+    if stripped == tail:
+        # No cue word: the body must directly follow «… в файл <name> » and be
+        # a bare literal, otherwise the write has no derivable content.
+        if prep != "в файл":
+            return ""
+        if not re.fullmatch(r"\"[^\"]+\"|'[^']+'|\S+", tail):
+            return ""
+    else:
+        tail = stripped
+    content = _cut_sentence(tail).strip()
+    if not content or _CONTENT_INTO_IT_DESCRIPTOR_RE.match(content):
+        return ""
+    return content
 
 
 def _extract_shell_command(goal: str) -> str:
@@ -880,6 +991,428 @@ class GoalPlan:
             return "workspace.read_text"
         return "workspace.write_text"
 
+
+
+# ── Canonical free-text request resolution ───────────────────────────────
+#
+# P0 (live defect 2026-09-18): ``POST /tasks`` hard-coded
+# ``tool_name="workspace.write_text"`` + ``path="task_output.txt"`` for EVERY
+# free-text message, so any request — including "запусти в оболочке команду ls"
+# and plain conversation — became a write of its own text, and the verifier
+# finalized DONE on that non-empty artifact. The single resolution below is the
+# only place a free-text request may be turned into an executable contract, and
+# it never fabricates a file body out of the request text.
+
+#: Shell lookalike first tokens a verb-less ASCII invocation may use.
+_BARE_COMMAND_VERBS = frozenset(_SHELL_VERBS)
+_ENGLISH_STOPWORDS = frozenset(
+    {"a", "an", "the", "is", "are", "was", "were", "who", "what", "why", "how",
+     "where", "me", "my", "you", "your", "and", "or", "to", "of", "in", "on",
+     "it", "this", "that", "please", "do", "does", "can", "could"}
+)
+
+
+def _bare_shell_command(goal: str) -> str:
+    """A verb-less ASCII invocation («ls -la /tmp», «pwd») is a command.
+
+    Deliberately conservative: any Cyrillic text, a question mark, an unknown
+    first token or an English stopword token means this is NOT a shell command
+    (mirrors the router's Step 20b heuristic).
+    """
+    if not goal or "?" in goal or re.search(r"[А-Яа-яЁё]", goal):
+        return ""
+    try:
+        import shlex
+
+        argv = shlex.split(goal)
+    except ValueError:
+        return ""
+    if not argv or argv[0].rsplit("/", 1)[-1].casefold() not in _BARE_COMMAND_VERBS:
+        return ""
+    for token in argv[1:]:
+        if token.startswith("-"):
+            continue
+        if token.casefold().strip("\"'") in _ENGLISH_STOPWORDS:
+            return ""
+    return goal
+
+
+def _route_intent(goal: str) -> IntentDecision | None:
+    """Route the free text through the canonical IntentRouter (never fatal)."""
+    try:
+        from antigona.router.intent_router import IntentRouter
+
+        return IntentRouter().route(goal)
+    except Exception:  # pragma: no cover - router must never break planning
+        return None
+
+
+@dataclass(frozen=True)
+class FreeTextRequest:
+    """Canonical (free text → executable contract) resolution.
+
+    ``answer_only`` is the fail-closed verdict: the request asks for no side
+    effect (a conversation/answer), or the requested effect cannot be
+    materialized faithfully from the text alone (an unresolvable shell command,
+    a write with no derivable content). Such a request must never be turned
+    into a file write of its own text, must never produce an artifact and must
+    never reach DONE.
+    """
+
+    intent: str
+    tool_name: str
+    path: str
+    content: str | None
+    command: tuple[str, ...]
+    answer_only: bool
+    requires_approval: bool
+    reason: str
+
+
+#: Canonical intents whose requested effect IS a workspace write. A write
+#: execution is the correct implementation for them — the file body may
+#: legitimately have been drafted by the model ("создай файл X о …").
+WRITE_EFFECT_INTENTS = frozenset(
+    {
+        "file_write",
+        "file_write_read",
+        "file_write_run",
+        "file_write_fix_run",
+        "task.file_write",
+        "task.file_edit",
+        "task.multi_file",
+    }
+)
+
+#: Canonical intents whose effect is produced by a DIFFERENT, typed tool (MCP,
+#: email, TTS, file-send). ``resolve_free_text_request`` reports them as
+#: effect-free only because it cannot carry their typed parameters — a
+#: limitation of this parser, NOT proof that the request has no effect. A
+#: consumer must therefore never treat their ``answer_only`` verdict as "this
+#: request performs nothing".
+TYPED_EFFECT_INTENTS = frozenset(
+    {"task.mcp", "task.email", "task.tts", "task.file_send"}
+)
+
+#: Reasons for which ``resolve_free_text_request`` PROVES that no side effect
+#: can be materialized: an ACTION was requested but its command could not be
+#: resolved (``task.shell``), or a read was requested with no named file
+#: (``task.file_read``). These come from the goal parser's own action intents.
+#:
+#: Deliberately NOT in this set: the generic bucket-4 fallthrough reason
+#: ``no_side_effect_requested:*``. It is produced for conversations, questions
+#: AND for typed-parameter requests (mcp/email/TTS), so it cannot distinguish
+#: "this request has no effect" from "this endpoint cannot express it" — a
+#: consumer that treats it as proof would reject every MCP/e-mail/TTS task and
+#: every write task whose goal the text parser reads as a plain sentence.
+NO_EFFECT_REASONS = frozenset(
+    {"shell_command_not_resolvable", "read_without_named_path"}
+)
+
+#: The unscoped target of the REMOVED free-text write path. A workspace write
+#: to this exact target is the degraded "store the request (or the model's
+#: answer) in a file" shape — it can never be an explicit contract, because a
+#: caller with a real target names it. Used as the last discriminator by the
+#: verifier's write-for-a-no-write-plan rule.
+LEGACY_DEFAULT_TARGET = "task_output.txt"
+
+#: Names that MEAN "write a file in the workspace". The TaskFlow contract uses
+#: ``workspace.write_text``; ``workspace.write`` is the capability-registry id
+#: (``tools/capability_registry.py``) that direct writers of ``CreateTask`` also
+#: use. The orchestrator executes both as one write and the verifier must judge
+#: both as one write — an alias must never slip past the self-write guard
+#: (FP-L05d).
+WRITE_TOOL_NAMES = ("workspace.write_text", "workspace.write")
+
+
+def canonical_tool_name(tool_name: str) -> str:
+    """Return the canonical name of ``tool_name`` (aliases collapsed).
+
+    Args:
+        tool_name: A tool name from a flow/step/plan.
+
+    Returns:
+        ``workspace.write_text`` for every write alias, the name unchanged
+        otherwise.
+    """
+    return "workspace.write_text" if tool_name in WRITE_TOOL_NAMES else tool_name
+
+
+def _answer_only(intent: str, reason: str, *, requires_approval: bool = False) -> FreeTextRequest:
+    return FreeTextRequest(
+        intent=intent,
+        tool_name=ANSWER_ONLY_TOOL,
+        path="stdout",
+        content="",
+        command=(),
+        answer_only=True,
+        requires_approval=requires_approval,
+        reason=reason,
+    )
+
+
+#: Characters only a real interpreter can honour. Splitting such a string with
+#: ``shlex.split`` yields the metacharacters as LITERAL argv tokens: the
+#: compound ``multi_file`` plan (``mkdir -p demo && touch demo/a.txt …``) became
+#: ``('mkdir', '-p', 'demo', '&&', 'touch', …)`` and the sandbox tried to run a
+#: program literally named ``&&`` — the requested files were never created. The
+#: previous planner wrapped these commands in ``sh -c``; deleting it (FP-L05)
+#: regressed every compound shell goal.
+#:
+#: FP-L03d (live defect): operators are not the only interpreter-only syntax.
+#: The WORD-EXPANSION constructs — glob ``*``/``?``, bracket ``[ ]``, brace
+#: ``{ }`` and tilde ``~`` — are equally meaningless to ``shlex.split``: it
+#: returned ``('ls', '/workspace/*.txt')``, so the sandbox ran ``ls`` with a
+#: literal argument and answered ``No such file or directory`` even though the
+#: ``*.txt`` files existed. Every one of them must reach a real interpreter.
+_SHELL_METACHAR_RE = re.compile(r"[&|;<>$`\\\n*?\[\]{}~]")
+
+
+def container_workspace_path() -> str:
+    """Return the container path the workspace is mounted at (single source).
+
+    The sandbox mounts the workspace directory at ``SandboxProfile.mount_target``
+    and runs every command with that directory as its workdir, so this string is
+    the only absolute path a sandbox command can legitimately name.
+    """
+    from antigona.sandbox.runner import SandboxProfile
+
+    return SandboxProfile.mount_target
+
+
+def _normalize_container_workspace_paths(raw: str) -> str:
+    """Rewrite sandbox-container absolute workspace paths to relative ones.
+
+    The task-creation gate (``result_safety.is_sensitive_path``) rejects EVERY
+    absolute path form, and the canonical rule for sandbox commands is the
+    relative form (``SandboxProfile.workdir`` *is* the mount target). Inside the
+    container ``/workspace/a.txt`` and ``a.txt`` therefore name the same file —
+    but only the relative form can be submitted at all: with the absolute form
+    the flow was never created and the owner got «Не удалось отправить задачу»
+    instead of output (live FP-L03d).
+
+    Only that one container mount root is rewritten, and only as a whole path
+    token: ``/etc/passwd`` stays absolute and is still refused by the gate,
+    ``/workspacefoo`` is a different path and is left untouched.
+    """
+    prefix = re.escape(container_workspace_path())
+    nested = re.sub(rf"(?<![\w./-]){prefix}/", "", raw)
+    return re.sub(rf"(?<![\w./-]){prefix}(?![\w./-])", ".", nested)
+
+
+def shell_argv(raw: str) -> tuple[str, ...]:
+    """Return the argv for a shell command string (the single place that decides it).
+
+    A command carrying shell metacharacters (``&&``, ``||``, ``|``, ``;``,
+    redirects, command substitution, a newline) or word-expansion constructs
+    (``*``, ``?``, ``[ ]``, ``{ }``, ``~``) must go through a real interpreter:
+    ``("sh", "-c", raw)``. Everything else is split into argv tokens. An
+    unparseable string also falls back to ``sh -c`` (fail-safe: the sandbox
+    still gets a runnable command).
+
+    The container's own workspace mount is rewritten into its relative form
+    first (``/workspace/a.txt`` → ``a.txt``), because the sandbox workdir IS
+    that mount and the creation gate refuses absolute path forms.
+
+    Args:
+        raw: The command as written by the user or built by the goal parser.
+
+    Returns:
+        The argv tuple, empty for an empty command.
+    """
+    text = _normalize_container_workspace_paths((raw or "").strip())
+    if not text:
+        return ()
+    if _SHELL_METACHAR_RE.search(text):
+        return ("sh", "-c", text)
+    try:
+        import shlex
+
+        argv = tuple(shlex.split(text))
+    except ValueError:
+        return ("sh", "-c", text)
+    return argv or ("sh", "-c", text)
+
+
+def resolve_free_text_request(
+    text: str, *, decision: IntentDecision | None = None
+) -> FreeTextRequest:
+    """Resolve a free-text request into tool/path/content/command (canonical).
+
+    The single resolver used by ``POST /tasks``, the transport planner and the
+    verifier's false-DONE guard. Intent comes from ``parse_goal`` (the dialogue
+    path's own parser) AND the canonical ``IntentRouter``; entities come from
+    ``parse_goal``. Nothing here ever falls back to "write the request text".
+
+    Args:
+        text: The raw owner message.
+        decision: Optional already-computed router decision (avoids re-routing).
+
+    Returns:
+        A :class:`FreeTextRequest`. ``answer_only=True`` means: create no
+        effect, write no file, expect no DONE.
+    """
+    goal = (text or "").strip()
+    route = decision if decision is not None else _route_intent(goal)
+    intent = str(getattr(route, "intent", "") or "")
+    router_approval = bool(getattr(route, "requires_approval", False))
+
+    plan = parse_goal(goal)
+    lower = goal.casefold()
+
+    # 1. Shell: the parser's compound plan or the router's task.shell verdict.
+    if plan.intent in ("shell", "multi_file") or intent == "task.shell":
+        raw_command = plan.command or (goal if intent == "task.shell" else "")
+        if raw_command and not plan.command:
+            raw_command = _bare_shell_command(raw_command)
+        command: tuple[str, ...] = ()
+        if raw_command:
+            command = shell_argv(raw_command)
+        if not command:
+            # An action verb with no resolvable command must not degrade into a
+            # write of the request text (the live false-DONE path).
+            return _answer_only(
+                "task.shell", "shell_command_not_resolvable", requires_approval=True
+            )
+        return FreeTextRequest(
+            intent="shell" if plan.intent != "multi_file" else "multi_file",
+            tool_name="sandbox.shell",
+            path=plan.path if plan.intent == "multi_file" else "stdout",
+            content=None,
+            command=command,
+            answer_only=False,
+            requires_approval=True,
+            reason="shell_plan",
+        )
+
+    # 2. File read: an explicitly named file only.
+    router_path = str((getattr(route, "entities", {}) or {}).get("path") or "")
+    if plan.intent == "file_read" or intent == "task.file_read":
+        path = plan.path or router_path
+        if not path:
+            return _answer_only("task.file_read", "read_without_named_path")
+        return FreeTextRequest(
+            intent="file_read",
+            tool_name="workspace.read_text",
+            path=path,
+            content=None,
+            command=(),
+            answer_only=False,
+            requires_approval=router_approval,
+            reason="read_plan",
+        )
+
+    # 3. File write: only to a NAMED path and only with the requested content.
+    write_intents = WRITE_EFFECT_INTENTS
+    if plan.intent in write_intents or intent in write_intents:
+        path = plan.path or router_path
+        content = plan.content or ""
+        if not path:
+            # A blind write with no named target is exactly how the defect
+            # recorded every message in task_output.txt.
+            return _answer_only("file_write", "write_without_named_path")
+        if not content.strip():
+            if re.search(r"\b(?:пустой|empty)\s+(?:файл|file)\b", lower):
+                content = ""  # an explicitly empty file IS the requested effect
+            else:
+                return _answer_only(
+                    "file_write", "write_content_not_derivable", requires_approval=True
+                )
+        return FreeTextRequest(
+            intent="file_write",
+            tool_name="workspace.write_text",
+            path=path,
+            content=content,
+            command=(),
+            answer_only=False,
+            requires_approval=router_approval,
+            reason="write_plan",
+        )
+
+    # 4. Everything else asks for no side effect: a conversation, an answer, a
+    # question, a command result — or an intent this endpoint cannot execute
+    # (mcp/tts/email need typed params). Fail closed: no artifact, no DONE.
+    if not goal:
+        return _answer_only("conversation.noise", "empty_message")
+    return _answer_only(intent or "conversation", f"no_side_effect_requested:{intent}")
+
+
+def resolve_submit_contract(
+    goal: str,
+    *,
+    tool_name: str | None = None,
+    path: str | None = None,
+    content: str | None = None,
+    command: tuple[str, ...] | list[str] = (),
+) -> FreeTextRequest:
+    """Resolve a STRUCTURED submit whose caller did not name a tool (FP-L05d).
+
+    The one rule for every submit surface that accepts a goal plus optional
+    ``tool_name``/``path``/``content`` (``POST /flows``, the Telegram
+    ``post_flow`` helper, the planner adapter):
+
+    * an EXPLICIT ``tool_name`` is a contract — returned verbatim;
+    * an explicit BODY the request itself does not supply (a non-empty
+      ``content`` that is not the goal text) is an explicit draft contract —
+      also returned verbatim, as ``workspace.write_text``;
+    * anything else is FREE TEXT: the tool/target/body are resolved by
+      :func:`resolve_free_text_request` — the same canonical resolver
+      ``POST /tasks`` and the brain use. It never falls back to "write the
+      request text".
+
+    Args:
+        goal: The submitted goal (the free-text request).
+        tool_name: The tool the caller named, if any.
+        path: The target the caller named, if any.
+        content: The body the caller supplied, if any.
+        command: The argv the caller supplied, if any.
+
+    Returns:
+        The resolved :class:`FreeTextRequest` for this submit.
+    """
+    explicit_command = tuple(command or ())
+    body = (content or "").strip()
+    if tool_name is not None:
+        return FreeTextRequest(
+            intent="explicit_tool",
+            tool_name=tool_name,
+            path=path or LEGACY_DEFAULT_TARGET,
+            content=content if content is not None else "",
+            command=explicit_command,
+            answer_only=tool_name == ANSWER_ONLY_TOOL,
+            requires_approval=False,
+            reason="explicit_tool_contract",
+        )
+    if body and body != (goal or "").strip():
+        # A caller-supplied body the request never mentioned: the caller owns
+        # this draft (tests/HITL submit path+content on purpose).
+        return FreeTextRequest(
+            intent="explicit_draft",
+            tool_name="workspace.write_text",
+            path=path or LEGACY_DEFAULT_TARGET,
+            content=content or "",
+            command=explicit_command,
+            answer_only=False,
+            requires_approval=False,
+            reason="explicit_draft_contract",
+        )
+    request = resolve_free_text_request(goal)
+    if request.answer_only:
+        return request
+    if request.command and not explicit_command:
+        return request
+    if explicit_command and not request.command:
+        return FreeTextRequest(
+            intent=request.intent,
+            tool_name=request.tool_name,
+            path=request.path,
+            content=request.content,
+            command=explicit_command,
+            answer_only=request.answer_only,
+            requires_approval=request.requires_approval,
+            reason=request.reason,
+        )
+    return request
 
 
 def requires_exact_write_read_contract(goal: str, *, content: str | None = None, tool_name: str = "workspace.write_text") -> bool:
@@ -1128,8 +1661,20 @@ def expected_paths_from_goal(goal: str) -> list[str]:
 
 
 __all__ = [
+    "ANSWER_ONLY_TOOL",
+    "LEGACY_DEFAULT_TARGET",
+    "NO_EFFECT_REASONS",
+    "TYPED_EFFECT_INTENTS",
+    "WRITE_EFFECT_INTENTS",
+    "FreeTextRequest",
     "GoalPlan",
     "expected_paths_from_goal",
     "parse_goal",
+    "requires_exact_write_read_contract",
+    "WRITE_TOOL_NAMES",
+    "canonical_tool_name",
+    "resolve_free_text_request",
+    "resolve_submit_contract",
+    "shell_argv",
     "strip_code_fences",
 ]

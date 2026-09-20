@@ -144,3 +144,31 @@ fail-closed:
 активации. `/etc/systemd/system` в этой волне не изменялся, `systemctl` не вызывался;
 проверка installer'а выполняется на throwaway DEST внутри evidence-каталога.
 
+## Operational prerequisite (2026-09-17)
+
+Шиппинговый drop-in
+[`deploy/systemd/dropins/10-antigona-startup-gate.conf`](../../../deploy/systemd/dropins/10-antigona-startup-gate.conf)
+добавляет в каждый юнит `ExecStartPre=<root>/scripts/startup_gate.sh`. Гейт запускает
+`python3 -m antigona.startup.validator --check=manifest`; валидатор разрешает
+deployment-envelope из переменной окружения `ANTIGONA_DEPLOYMENT_MANIFEST` либо, по
+умолчанию, из `<code-root>/CANDIDATE_DEPLOYMENT_MANIFEST.json`
+(`src/antigona/startup/validator.py:181`). Envelope **не публикуется** (см.
+`build_public_release_w5v16_b39.sh`, `ALLOWED_REF`: "deployment envelope supplied by the
+operator ... never shipped") — его поставляет оператор. Следствие, измеренное
+2026-09-17 на публичном клоне: на чистом source-checkout без envelope гейт fail-closed,
+завершается с rc=1, и systemd **отменяет** запуск юнита.
+
+Единственный документированный обход — `ANTIGONA_SKIP_STARTUP_GATE=1` (громкий, виден
+в journal; измерено: rc=0); либо предоставить envelope и указать на него
+`ANTIGONA_DEPLOYMENT_MANIFEST`.
+
+Измеренный вывод (verbatim):
+
+```text
+=== Runtime Validator — manifest ===
+  [CRITICAL] ❌ contract:C11:deployment_manifest: manifest verification failed: [Errno 2] No such file or directory: '<clone>/CANDIDATE_DEPLOYMENT_MANIFEST.json'
+  [WARN    ] ✅ contract:C11:evidence_chain: C11 verdict journalled at sha256:8d957f61...
+⛔ КРИТИЧЕСКИЕ НАРУШЕНИЯ — запуск отменён.
+CRITICAL: startup gate FAIL-CLOSED - immutability validation (--check=manifest)
+```
+

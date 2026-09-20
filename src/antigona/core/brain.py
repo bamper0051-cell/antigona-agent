@@ -48,6 +48,7 @@ from antigona.sessions.repository import SessionRepository
 from antigona.task_goal import (
     parse_goal,
     requires_exact_write_read_contract,
+    resolve_free_text_request,
     strip_code_fences,
 )
 from antigona.tools.workspace_read import TOOL_NAME as WORKSPACE_READ_TEXT
@@ -3361,9 +3362,24 @@ class AntigonaBrain:
                 intent=intent.intent,
             )
 
+        # FP-L05b (live defect 2026-09-18T01:07Z): the tool for a free-text
+        # request is decided by the CANONICAL resolver — the same
+        # ``resolve_free_text_request`` POST /tasks and FlowEnginePlanner.plan
+        # use — not by this module's local heuristic. The heuristic returned
+        # ``None`` for "запусти в оболочке команду ls и покажи её вывод", so
+        # ``tool_name`` stayed unset, the request fell through to the default
+        # write path and the flow was created as ``workspace.write_text`` with
+        # the model's drafted answer as the file body. The verifier's plan
+        # correctly required ``sandbox.shell``, so the owner got a refusal
+        # ("executed tool … does not implement the goal's plan tool") instead
+        # of the output of ``ls``.
+        canonical_request = resolve_free_text_request(text, decision=intent)
         tool_name: str | None = None
         command: tuple[str, ...] = ()
-        if intent.intent in ("task.shell", "ambiguous.mixed_intent"):
+        if canonical_request.tool_name == "sandbox.shell" and canonical_request.intent == "shell":
+            tool_name = "sandbox.shell"
+            command = canonical_request.command
+        elif intent.intent in ("task.shell", "ambiguous.mixed_intent"):
             extracted = _extract_shell_command(text)
             if extracted:
                 tool_name = "sandbox.shell"
@@ -3434,6 +3450,25 @@ class AntigonaBrain:
                 correlation_id=correlation_id or "",
                 email_to=str(tts_params.get("to") or ""),
                 source_message=text,
+            )
+
+        # FP-L05b, fail-closed half: an action request whose effect the canonical
+        # resolver could NOT resolve is not a file write of its own text. Before
+        # this guard the request fell through to the default write path, the LLM
+        # drafted an answer, and the flow claimed a completed "side effect" that
+        # implemented no plan. Create no flow at all.
+        if (
+            tool_name is None
+            and canonical_request.answer_only
+            and intent.intent in ("task.shell", "ambiguous.mixed_intent")
+        ):
+            return BrainResponse(
+                text=(
+                    "Не удалось разобрать команду для оболочки. "
+                    "Напиши её точнее, например: «выполни ls -la»."
+                ),
+                response_type=ResponseType.CLARIFICATION,
+                intent=intent.intent,
             )
 
         # Predict whether this shell command will actually need a manual
@@ -3661,6 +3696,27 @@ class AntigonaBrain:
                 metadata={"result": result},
             )
         except Exception as exc:
+            from antigona.repository import SensitiveTaskInput
+
+            if isinstance(exc, SensitiveTaskInput):
+                # A policy refusal is a MESSAGE, not an internal failure.  The
+                # owner must learn that the request was refused (and roughly
+                # why), instead of the opaque «не удалось отправить задачу»,
+                # which is indistinguishable from a broken backend (FP-L03d).
+                logger.warning(
+                    "task submit refused by safety policy for session=%s",
+                    session_id,
+                )
+                return BrainResponse(
+                    text=(
+                        "🚫 Команда не отправлена: её отклонила защита. "
+                        "Абсолютные host-пути и секретные файлы в командах "
+                        "запрещены — напиши команду в пределах рабочей папки, "
+                        "например: «выполни ls -la» или «выполни ls *.txt»."
+                    ),
+                    response_type=ResponseType.CLARIFICATION,
+                    intent=intent.intent,
+                )
             logger.warning(
                 "task_backend submit failed for session=%s: %s",
                 session_id,

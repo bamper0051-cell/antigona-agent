@@ -124,7 +124,20 @@ class DeliveryReceipt(Base):
     adapter: Mapped[str] = mapped_column(String(32), default="")
     task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    #: Transmission-level flag: True means the message left the process toward the
+    #: external channel. It is NOT confirmation of delivery to the recipient and
+    #: must never be read as such (see ``antigona.delivery.readback``).
     transmitted: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: B53 (DELIV-02): provider-level confirmation. ``provider_message_id`` holds
+    #: the identifier the provider returned for the message (e.g. Telegram
+    #: ``message_id``). ``read_back_status`` is one of SEND_ACK / UNSUPPORTED /
+    #: REFUTED (see ``antigona.delivery.readback``): SEND_ACK confirms *transmission*
+    #: only, never that a human read the message; UNSUPPORTED is never a delivery
+    #: claim. ``read_back_at`` records when the acknowledgement was obtained. All
+    #: three are nullable so pre-B53 rows stay valid without a backfill.
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    read_back_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    read_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class EvidenceRecord(Base):

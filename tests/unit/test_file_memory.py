@@ -11,9 +11,9 @@ from pathlib import Path
 import pytest
 
 from antigona.context.builder import ContextBuilder
+from antigona.memory import file_memory as file_memory_module
 from antigona.memory.file_memory import (
     CHAR_LIMITS,
-    MEMORY_DIR,
     FileMemory,
     _parse_entries,
     _serialize_entries,
@@ -47,9 +47,26 @@ def memory(memory_dir: Path) -> FileMemory:
 
 
 @pytest.fixture(autouse=True)
-def _clear_default_memory() -> None:
-    """Clear the default .memory/ dir before each test so tests don't leak."""
-    for f in MEMORY_DIR.glob("*"):
+def _clear_default_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Clear the default .memory/ dir before each test so tests don't leak.
+
+    The default memory root is a *temporary* directory, never the checkout's
+    real ``.memory/``: the module-level constants and the
+    ``ANTIGONA_MEMORY_ROOT`` env var are redirected to a per-test tmp dir, so
+    both the import-time ``MEMORY_DIR`` and the lazily resolved
+    ``_default_memory_dir()`` point at the temp root.  The temp dir's stores
+    are then cleared before the test runs.
+    """
+    tmp = tmp_path_factory.mktemp("default_memory")
+    monkeypatch.setattr(file_memory_module, "MEMORY_DIR", tmp)
+    monkeypatch.setattr(file_memory_module, "MEMORY_FILE", tmp / "MEMORY.md")
+    monkeypatch.setattr(file_memory_module, "USER_FILE", tmp / "USER.md")
+    monkeypatch.setenv("ANTIGONA_MEMORY_ROOT", str(tmp))
+    (tmp / "MEMORY.md").write_text("", encoding="utf-8")
+    (tmp / "USER.md").write_text("", encoding="utf-8")
+    for f in tmp.glob("*"):
         f.write_text("", encoding="utf-8")
 
 
@@ -231,8 +248,8 @@ class TestContextBuilderFrozenSnapshot:
 
     def test_build_without_memory_no_blocks(self) -> None:
         """When default ContextBuilder has no file_memory, no memory blocks appear.
-        
-        The global .memory/ dir is cleared by autouse fixture.
+
+        The default .memory/ dir is redirected to a temp dir by autouse fixture.
         """
         builder = ContextBuilder()
         messages = builder.build()

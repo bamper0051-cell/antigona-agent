@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,9 +27,14 @@ __all__ = [
     "DialogueEngine",
     "FileContentDraft",
     "clean_telegram_tags",
+    "contradicts_a_successful_tool",
     "extract_request_literals",
+    "internal_marker_leak",
+    "internal_markers_in",
     "looks_like_clarification",
     "looks_like_tool_protocol_markup",
+    "succeeded_tool_names_in",
+    "ungrounded_tool_output_claim",
     "validate_draft_literals",
 ]
 
@@ -214,6 +219,210 @@ _NEUTRAL_NO_ACTION_REPLY = (
     "Уточните, что нужно сделать, и я выполню."
 )
 
+#: Honest answer for a reply that PRESENTS a tool result no real tool result
+#: backs (FP-L06).  States the fact plainly — the tool was not called — and
+#: names no invented error text.
+_UNGROUNDED_TOOL_OUTPUT_REPLY = (
+    "В этом сообщении я инструменты не вызывала — предъявлять их вывод "
+    "(в том числе текст ошибки) мне не из чего. Назовите команду, и я "
+    "выполню её по-настоящему и покажу реальный результат."
+)
+
+#: Honest answer for the CONTRADICTION case (FP-L06b strong rule): the turn's
+#: own tool SUCCEEDED, yet the reply calls that same tool broken.  Names no
+#: invented error text and does not pretend no tool was called.
+_UNGROUNDED_TOOL_BREAKAGE_REPLY = (
+    "Инструмент в этом же сообщении отработал успешно, поэтому утверждение о "
+    "его поломке я не привожу: оно противоречит реальному результату и было бы "
+    "выдумкой. Назовите команду, и я выполню её заново и покажу вывод."
+)
+
+#: Structural signatures of a reply PRESENTING a tool's output/error as fact
+#: (FP-L06).  Deterministic string containment: «[ERROR] …», «вывод: …»,
+#: the engine's own tool narrative, an import/exit-code diagnosis, or the live
+#: fabrication phrasings («та же поломка», «команда не стартовала»).
+_TOOL_OUTPUT_CLAIM_RE = re.compile(
+    r"(?:"
+    r"\[error\]"
+    r"|\[tool_error\]"
+    r"|traceback\s*\(most recent call last\)"
+    r"|cannot import name"
+    r"|importerror\s*:"
+    r"|modulenotfounderror\s*:"
+    r"|exit[_ ]code\s*[:=]"
+    r"|вывод(?:\s+команды|\s+инструмента|\s+оболочки)?\s*:"
+    r"|stdout\s*:"
+    r"|stderr\s*:"
+    r"|инструмент\s*`[^`]+`\s*(?:выполнен|не выполнен)"
+    r"|команда\s+(?:даже\s+)?не\s+стартовала"
+    r"|та же\s+поломка"
+    r")",
+    re.IGNORECASE,
+)
+
+#: Breakage phrasings of a claim about an INSTRUMENT'S STATE (FP-L06b):
+#: «<инструмент> сломан / не работает / недоступен / падает».  The captured
+#: group is the instrument the claim is about — the tool identity the STRONG
+#: RULE compares against the tools that actually SUCCEEDED this turn.
+_TOOL_BREAKAGE_SUBJECT_RE = re.compile(
+    r"`?\b([A-Za-z_][A-Za-z0-9_.\-]*)\b`?\s+"
+    r"(?:сейчас\s+|снова\s+|опять\s+|всё\s+ещё\s+)?"
+    r"(?:сломан\w*|поломан\w*|не\s+работает|недоступ\w*|пада\w*|упал\w*|"
+    r"не\s+запускается|не\s+отвечает)",
+    re.IGNORECASE,
+)
+
+#: The same breakage phrasings PLUS the instrument-word forms («оболочка не
+#: работает») — the structural shape of a state claim, independent of identity.
+_TOOL_BREAKAGE_RE = re.compile(
+    r"(?:"
+    r"`?[A-Za-z_][A-Za-z0-9_.\-]*`?\s+"
+    r"(?:сейчас\s+|снова\s+|опять\s+|всё\s+ещё\s+)?"
+    r"(?:сломан\w*|поломан\w*|не\s+работает|недоступ\w*|пада\w*|упал\w*|"
+    r"не\s+запускается|не\s+отвечает)"
+    r"|(?:инструмент\w*|оболочк\w*|шелл\w*|терминал\w*|shell|tool)\s+"
+    r"(?:сейчас\s+)?(?:сломан\w*|поломан\w*|не\s+работает|недоступ\w*|пада\w*)"
+    r")",
+    re.IGNORECASE,
+)
+
+#: A Python failure DIAGNOSIS recalled in prose (FP-L06b): the exception name
+#: plus the module path it happened in …
+_EXCEPTION_NAME_RE = re.compile(
+    r"\b(?:ImportError|ModuleNotFoundError|AttributeError|NameError|RuntimeError"
+    r"|TypeError|ValueError|KeyError|OSError|IndexError|FileNotFoundError"
+    r"|PermissionError)\b"
+)
+#: … the module path itself («antigona.sandbox.runner»).
+_MODULE_PATH_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]*[A-Za-z0-9_]\b")
+#: … or the plain wording «ошибка импорта <X>».
+_IMPORT_ERROR_WORDING_RE = re.compile(
+    r"ошибк\w*\s+импорта|import\s*error", re.IGNORECASE
+)
+
+
+def _recalls_python_failure(text: str) -> bool:
+    """True, если ответ пересказывает диагноз Python-сбоя (FP-L06b)."""
+    if _IMPORT_ERROR_WORDING_RE.search(text or ""):
+        return True
+    return bool(
+        _EXCEPTION_NAME_RE.search(text or "") and _MODULE_PATH_RE.search(text or "")
+    )
+
+
+def _presents_a_tool_output_or_diagnosis(text: str) -> bool:
+    """Структурная проверка: ответ предъявляет вывод/диагноз инструмента.
+
+    Anchored output shapes, instrument-state (breakage) claims and recalled
+    Python failure diagnoses are all claims about a tool that need a real tool
+    result of THIS turn behind them (FP-L06 / FP-L06b).
+    """
+    body = text or ""
+    return bool(
+        _TOOL_OUTPUT_CLAIM_RE.search(body)
+        or _TOOL_BREAKAGE_RE.search(body)
+        or _recalls_python_failure(body)
+    )
+
+
+def _claims_breakage_of(text: str, succeeded_tools: Iterable[str]) -> bool:
+    """True, если *text* объявляет сломанным инструмент из *succeeded_tools*.
+
+    The STRONG RULE of FP-L06b: a tool that produced a SUCCESSFUL result in the
+    very same turn cannot be described as broken — the claim contradicts the
+    real outcome and is unconditionally false.
+    """
+    names = {name.strip().lower() for name in succeeded_tools or () if name and name.strip()}
+    if not names:
+        return False
+    subjects = {m.group(1).lower() for m in _TOOL_BREAKAGE_SUBJECT_RE.finditer(text or "")}
+    return bool(subjects & names)
+
+
+#: JSON fields of a REAL tool result that carry the output a reply may quote.
+_GROUNDING_ANCHOR_KEYS: tuple[str, ...] = (
+    "output",
+    "stdout",
+    "stderr",
+    "content",
+    "error",
+    "message",
+    "reason",
+    "path",
+)
+
+
+def _normalize_for_grounding(text: str) -> str:
+    """Whitespace-insensitive form used for the containment check."""
+    return " ".join((text or "").split())
+
+
+def _grounding_anchors(real_output: str) -> list[str]:
+    """Texts of a real tool result that may legitimately appear in a reply.
+
+    A JSON envelope contributes its output/error field AND its whole raw text;
+    a plain result contributes its text.  Short (<4 chars) fragments are
+    dropped — they would ground a claim by accident.
+    """
+    text = (real_output or "").strip()
+    if not text:
+        return []
+    anchors: list[str] = []
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        for key in _GROUNDING_ANCHOR_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and len(value.strip()) >= 4:
+                anchors.append(value.strip())
+    if len(text) >= 4:
+        anchors.append(text)
+    return anchors
+
+
+def ungrounded_tool_output_claim(
+    reply_text: str,
+    grounded_outputs: Iterable[str] = (),
+    *,
+    succeeded_tools: Iterable[str] = (),
+) -> bool:
+    """Whether *reply_text* asserts a tool output/state no real result backs.
+
+    The single deterministic criterion for the grounding contract:
+
+    * a reply that presents a tool result (``[ERROR] …``, «вывод: …», the tool
+      narrative, an import/exit-code diagnosis) OR claims an instrument's state
+      («`sandbox.shell` сейчас сломан», «ошибка импорта X») is admissible ONLY
+      when some real tool result of THIS same turn is quoted in it;
+    * with no real result, the claim is a FABRICATION (or a stale diagnosis
+      re-presented as current) and must be reformulated — never shown as fact.
+
+    STRONG RULE (FP-L06b): ``succeeded_tools`` names the tools whose result
+    SUCCEEDED in this very turn.  A claim that one of them is broken
+    contradicts the real outcome and is FALSE UNCONDITIONALLY — it is flagged
+    even when the very same reply also quotes that successful result.
+
+    ``grounded_outputs`` are the raw result strings of the current turn; a
+    result grounds a claim when one of its output anchors is contained in the
+    reply (whitespace-insensitive).  A reply that asserts no tool output and no
+    instrument state at all is never flagged.
+    """
+    text = reply_text or ""
+    # STRONG RULE first: no grounding can make a contradiction true.
+    if _claims_breakage_of(text, succeeded_tools):
+        return True
+    if not _presents_a_tool_output_or_diagnosis(text):
+        return False
+    normalized_reply = _normalize_for_grounding(text)
+    for real_output in grounded_outputs or ():
+        for anchor in _grounding_anchors(real_output):
+            normalized_anchor = _normalize_for_grounding(anchor)
+            if len(normalized_anchor) >= 4 and normalized_anchor in normalized_reply:
+                return False
+    return True
+
 
 def _prior_tool_error_texts(turn_buffer: list[dict[str, Any]]) -> list[str]:
     """Error texts of PREVIOUS turns, taken from the recorded history."""
@@ -230,8 +439,121 @@ def _prior_tool_error_texts(turn_buffer: list[dict[str, Any]]) -> list[str]:
 
 
 def _contains_internal_error_marker(text: str) -> bool:
+    """Legacy predicate: internal marker with NO owner context (a leak).
+
+    Thin wrapper — the rule itself lives in :func:`internal_marker_leak`.
+    """
+    return internal_marker_leak(text)
+
+
+#: Structural signatures of an error/refusal answer.  A reply carrying one of
+#: them is a REAL failure/denial leak even when the owner happened to use the
+#: term in their own message (FP-L22) — the exemption below never applies.
+_ERROR_STRUCTURE_MARKERS: tuple[str, ...] = (
+    _TOOL_ERROR_TAG.lower(),  # "[tool_error]"
+    "traceback",
+    "отказано",
+    "отказался",
+    "отклонено",
+    "заблокировано",
+    "заблокирован",
+    "denied",
+    "denying",
+    "blocked",
+    "refused",
+    "not permitted",
+    "error:",
+    "ошибка:",
+)
+
+
+def internal_markers_in(text: str) -> frozenset[str]:
+    """Internal fail-closed markers literally present in *text* (lowercased)."""
     low = (text or "").lower()
-    return any(marker in low for marker in _INTERNAL_ERROR_MARKERS)
+    return frozenset(marker for marker in _INTERNAL_ERROR_MARKERS if marker in low)
+
+
+def _looks_like_error_structure(text: str) -> bool:
+    """True, если ответ имеет структуру ошибки/отказа, а не объяснения."""
+    low = (text or "").lower()
+    return any(marker in low for marker in _ERROR_STRUCTURE_MARKERS)
+
+
+#: Service error/denial IDIOMS — wording that only ever originates from an
+#: internal refusal or diagnosis, never from a sentence explaining a term
+#: (FP-L22b).  A marker standing in one of these is service text, not a quote.
+_SERVICE_ERROR_PHRASES: tuple[str, ...] = (
+    "denied_stale_fence",
+    "stale fence",
+    "no fencing token",
+    "has no fencing token",
+    "enabled but write surface",
+    "no write permit",
+    "write permit denied",
+    "write permit is required",
+    "write permit required",
+    "owner lease expired",
+    "lease expired",
+)
+
+#: Denial/refusal vocabulary that turns an internal marker in its immediate
+#: window into SERVICE text rather than an explanation of the term.
+_DENIAL_WINDOW_RE = re.compile(
+    r"(?:denied|denying|refused|blocked|rejected|forbidden|invalid|expired"
+    r"|not\s+permitted|отказан\w*|отклонен\w*|отклонён\w*|заблокирован\w*"
+    r"|запрещен\w*|запрещён\w*|недопустим\w*)",
+    re.IGNORECASE,
+)
+
+
+def _markers_are_service_error_text(text: str, markers: frozenset[str]) -> bool:
+    """True, если хотя бы один маркер стоит в служебном тексте ошибки/отказа.
+
+    A marker only LEAKS when it is part of an internal refusal/diagnosis: an
+    explicit service idiom, or denial vocabulary in its immediate window.  The
+    same marker inside an ordinary EXPLANATION of the term («write permit — это
+    …») is not service text and must not be mistaken for a leak (FP-L22b).
+    """
+    norm = " ".join((text or "").lower().split())
+    if any(phrase in norm for phrase in _SERVICE_ERROR_PHRASES):
+        return True
+    for marker in markers:
+        start = norm.find(marker)
+        if start < 0:
+            continue
+        window = norm[max(0, start - 80) : start + len(marker) + 80]
+        if _DENIAL_WINDOW_RE.search(window):
+            return True
+    return False
+
+
+def internal_marker_leak(reply_text: str, user_text: str = "") -> bool:
+    """Whether *reply_text* LEAKS internal fail-closed wording (FP-L22).
+
+    The single, deterministic criterion shared by the dialogue-engine guard and
+    the Telegram bot guard — string containment only, no heuristics:
+
+    * A marker the OWNER used in this same turn's message is a QUOTED TERM
+      («что такое fail-closed?»), not a leak: the model is answering about it,
+      so the reply must be returned as-is.
+    * An unasked marker is a leak only when it stands in SERVICE text: inside an
+      error/refusal structure, or inside a replayed error/refusal idiom
+      (FP-L22b).  A marker that merely appears in an EXPLANATORY sentence — the
+      definition of a related term the owner asked about («write permit — это
+      разрешение…, принцип fail-closed») — is not a leak, and the answer is
+      returned instead of the stub.
+    * An error/refusal-shaped reply is ALWAYS a leak, even when the owner asked
+      about the term: a real denial leak stays suppressed.
+    """
+    reply_markers = internal_markers_in(reply_text)
+    if not reply_markers:
+        return False
+    if _looks_like_error_structure(reply_text):
+        return True
+    unasked = reply_markers - internal_markers_in(user_text)
+    if not unasked:
+        return False
+    return _markers_are_service_error_text(reply_text, unasked)
 
 
 def _is_stale_error_replay(reply_text: str, prior_errors: list[str]) -> bool:
@@ -258,10 +580,36 @@ def _is_stale_error_replay(reply_text: str, prior_errors: list[str]) -> bool:
 _TOOL_PROTOCOL_JSON_KEYS = ("tool_calls", "function")
 
 # Регулярка нарратива выполненного инструмента: «Инструмент `имя` выполнен: ...».
+# Группа 1 — имя инструмента: по ней восстанавливается идентичность того, чей
+# УСПЕШНЫЙ результат предъявлен в ответе (STRONG RULE FP-L06b).
 _TOOL_RESULT_NARRATIVE_RE = re.compile(
-    r"Инструмент\s*`\s*[\w.\-]+\s*`\s*выполнен\s*:",
+    r"Инструмент\s*`\s*([\w.\-]+)\s*`\s*выполнен\s*:",
     re.IGNORECASE,
 )
+
+
+def succeeded_tool_names_in(reply_text: str) -> tuple[str, ...]:
+    """Имена инструментов, чей УСПЕШНЫЙ результат предъявлен в *reply_text*.
+
+    The engine renders a real result as «Инструмент `name` выполнен: …» — that
+    line is service-rendered from the actual execution, so its presence is the
+    turn's own proof that the tool SUCCEEDED.  Callers use it to hand the
+    criterion the identity for the FP-L06b strong rule without re-deriving it.
+    """
+    return tuple(
+        m.group(1) for m in _TOOL_RESULT_NARRATIVE_RE.finditer(reply_text or "")
+    )
+
+
+def contradicts_a_successful_tool(reply_text: str) -> bool:
+    """FP-L06b strong rule: the reply calls broken a tool that SUCCEEDED here.
+
+    Thin composition of the shared criterion with the identities recovered from
+    the reply's own success narrative — no second rule, no second marker list.
+    """
+    text = reply_text or ""
+    return _claims_breakage_of(text, succeeded_tool_names_in(text))
+
 
 # Ключи, сигнализирующие о inline JSON-РЕЗУЛЬТАТЕ выполнения инструмента
 # (в отличие от JSON-конверта вызова, который покрывается выше).
@@ -513,6 +861,9 @@ class DialogueEngine:
         # error text) of an earlier turn.
         self._last_tool_outcome: str | None = None
         self._last_tool_error: str | None = None
+        # FP-L06: the RAW result text of this turn's tool call (if any) — the
+        # only admissible grounding for a reply that presents a tool output.
+        self._last_tool_result: str | None = None
 
     async def close(self) -> None:
         """Close the underlying session repository and injected provider if open."""
@@ -543,6 +894,7 @@ class DialogueEngine:
         # never be re-presented as this turn's result.
         self._last_tool_outcome = None
         self._last_tool_error = None
+        self._last_tool_result = None
 
         stripped = text.strip()
         if not stripped:
@@ -629,14 +981,38 @@ class DialogueEngine:
         #     or produced text carrying fail-closed/security internals, do NOT
         #     present it as the current answer — answer neutrally instead.
         if self._last_tool_outcome is None and reply_text:
+            # FP-L22: a marker the OWNER used in THIS turn's message is a quoted
+            # term («что такое fail-closed?») — the answer about it is returned
+            # as-is; only an UNASKED marker (or an error/refusal-shaped reply)
+            # is a leak (shared criterion: internal_marker_leak).
             if _is_stale_error_replay(
                 reply_text, _prior_tool_error_texts(turn_buffer)
-            ) or _contains_internal_error_marker(reply_text):
+            ) or internal_marker_leak(reply_text, stripped):
                 logger.info(
                     "Suppressed a stale/echoed previous-turn failure in the "
                     "conversation reply (session=%s)", session_id,
                 )
                 reply_text = _NEUTRAL_NO_ACTION_REPLY
+            # FP-L06: this turn ran NO tool, so no real tool result can back a
+            # claim of the shape «инструмент вернул …» / «[ERROR] …» / «вывод: …».
+            # Such a claim is an invented output (or a stale diagnosis replayed
+            # as current) — answer honestly instead of presenting it as fact.
+            elif ungrounded_tool_output_claim(reply_text, ()):
+                logger.info(
+                    "Suppressed an ungrounded tool-output claim in the "
+                    "conversation reply (session=%s)", session_id,
+                )
+                reply_text = _UNGROUNDED_TOOL_OUTPUT_REPLY
+        # ── FP-L06b: a tool that SUCCEEDED in this very turn is a fact ────
+        # The rendered «Инструмент `X` выполнен: …» line comes from the REAL
+        # execution of this turn.  A reply that still calls that same tool
+        # broken contradicts the outcome — never present it as the answer.
+        elif reply_text and contradicts_a_successful_tool(reply_text):
+            logger.info(
+                "Suppressed a breakage claim about a tool that succeeded in "
+                "the same turn (session=%s)", session_id,
+            )
+            reply_text = _UNGROUNDED_TOOL_BREAKAGE_REPLY
 
         # Clean any accidental Telegram tags from reply
         reply_text = clean_telegram_tags(reply_text)
@@ -814,6 +1190,7 @@ class DialogueEngine:
         # previous turn can never be attributed to this one.
         self._last_tool_outcome = None
         self._last_tool_error = None
+        self._last_tool_result = None
         session_id = session_id[:256] if session_id else ""
         if not self.registry:
             return reply_text
@@ -865,6 +1242,7 @@ class DialogueEngine:
             logger.warning("Denied unadvertised tool invocation attempt: '%s'", name)
             self._last_tool_outcome = "DENIED"
             self._last_tool_error = f"tool {name!r} is not available in this mode"
+            self._last_tool_result = self._last_tool_error
             reply_text = reply_text[: m.start()] + reply_text[m.end():]
             return reply_text.strip() + f"\n\n⚠️ Инструмент `{name}` недоступен в этом режиме или требует вызова через систему политик."
 
@@ -900,6 +1278,9 @@ class DialogueEngine:
             outcome, error = _tool_result_outcome(result_text)
             self._last_tool_outcome = outcome
             self._last_tool_error = error
+            # FP-L06: the RAW result of this turn — the only grounding a reply
+            # is allowed to quote as a tool output.
+            self._last_tool_result = result_text
             reply_text = reply_text[: m.start()] + reply_text[m.end():]
             voice_marker = voice_marker_from_tool_result(result_text)
             if voice_marker:
@@ -915,6 +1296,7 @@ class DialogueEngine:
         except Exception as exc:
             self._last_tool_outcome = "FAILED"
             self._last_tool_error = str(exc)
+            self._last_tool_result = str(exc)
             return reply_text.strip() + "\n\nИнструмент `" + name + "` не выполнен: " + str(exc)
 
     def _extract_and_store_memorize(

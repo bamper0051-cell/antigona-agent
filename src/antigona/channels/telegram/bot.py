@@ -85,6 +85,20 @@ from antigona.conversation.engine import (  # noqa: F401
     is_chitchat_or_noise,
 )
 
+# ── FP-L22: single shared truthfulness criterion ───────────────────────────
+# The stale-error marker set, the neutral stub and the leak criterion are NOT
+# duplicated in this module — they live in ``conversation.dialogue_engine`` and
+# are imported here so both guards use one and the same rule.
+from antigona.conversation.dialogue_engine import (  # noqa: F401
+    _INTERNAL_ERROR_MARKERS as _STALE_ERROR_MARKERS,
+    _NEUTRAL_NO_ACTION_REPLY as _NEUTRAL_STALE_ERROR_REPLY,
+    _UNGROUNDED_TOOL_BREAKAGE_REPLY,
+    _UNGROUNDED_TOOL_OUTPUT_REPLY,
+    contradicts_a_successful_tool,
+    internal_marker_leak,
+    ungrounded_tool_output_claim,
+)
+
 from antigona.database import Database
 
 # ── Operation Store & Presenter ────────────────────────────────────────────
@@ -528,6 +542,20 @@ def _coerce_flow_status(value: object) -> FlowStatus | None:
         return None
 
 
+def _open_operation_state(status: FlowStatus | None) -> OperationState:
+    """Map a still-open flow status onto the OperationState that DESCRIBES it.
+
+    The terminal wait has a budget; when it expires the flow keeps running and
+    the operation must NOT be reported as a blanket ``RUNNING``.  A flow parked
+    on an approval (or on any other owner decision) is waiting for the OWNER,
+    which is exactly ``WAITING_USER`` — the presenter can then tell the truth
+    («ждёт вашего решения») instead of dropping a nonterminal outcome (FP-L03d).
+    """
+    if status in (FlowStatus.WAITING_APPROVAL, FlowStatus.WAITING_USER):
+        return OperationState.WAITING_USER
+    return OperationState.RUNNING
+
+
 def _processing_terminal_state(result: Any) -> OperationState | None:
     """Map one typed pipeline result to an operation terminal, fail-closed."""
     outcome = _coerce_processing_outcome(getattr(result, "outcome", None))
@@ -635,33 +663,20 @@ def _sanitize_user_facing_error(text: str) -> str:
     return text
 
 
-#: Multi-word fail-closed internals that ONLY originate from an error/denial —
-#: never from a legitimate conversational answer.  (Narrower than
-#: ``_INTERNAL_SECURITY_MARKERS``: a bare "ownership" can appear in a normal
-#: discussion, so it is NOT used to suppress a conversation turn.)
-_STALE_ERROR_MARKERS: tuple[str, ...] = (
-    "fencing token",
-    "ownership fence",
-    "fail-closed",
-    "fail closed",
-    "denied_stale_fence",
-    "stale fence",
-    "write permit",
-    "owner lease",
-)
-
-#: Neutral answer for a conversation turn that executed NO tool.  Used when the
-#: model output merely replays a previous turn's failure: an old error must
-#: never be presented as the current turn's result.
-_NEUTRAL_STALE_ERROR_REPLY = (
-    "В этом сообщении я ничего не выполняла — это обычный ответ. "
-    "Уточните, что нужно сделать, и я выполню."
-)
+#: FP-L22: the guard is NOT re-implemented here.  The stale-error marker set,
+#: the neutral stub text and the criterion itself live in exactly ONE place —
+#: ``antigona.conversation.dialogue_engine`` — and are imported at the top of
+#: this module.  The criterion additionally keeps an owner-quoted internal term
+#: («что такое fail-closed?») from being mistaken for a leak.
 
 
 def _contains_stale_error_marker(text: str) -> bool:
-    low = (text or "").lower()
-    return any(marker in low for marker in _STALE_ERROR_MARKERS)
+    """Marker present with NO owner context (no user message supplied).
+
+    Legacy thin wrapper around the single shared criterion: with an empty user
+    message the exemption can never apply, so a present marker is a leak.
+    """
+    return internal_marker_leak(text)
 
 
 # ─── Telegram Bot Handler (thin) ──────────────────────────────────────────────
@@ -2546,20 +2561,52 @@ class TelegramBot(TelegramTransport):
             tool_failed = tool_outcome in ("FAILED", "DENIED", "PARTIAL")
             # Truthfulness: a turn that executed NO tool cannot present a
             # failure.  If a plain conversation reply nonetheless carries
-            # fail-closed internals, it is a stale/echoed failure from an
-            # earlier turn — answer neutrally instead of re-presenting the old
-            # error as this turn's result.
+            # fail-closed internals the OWNER did not ask about, it is a
+            # stale/echoed failure from an earlier turn — answer neutrally
+            # instead of re-presenting the old error as this turn's result.
+            # FP-L22: a term the owner used in THIS message («что такое
+            # fail-closed?») is a quoted term, not a leak — shared criterion.
             if (
                 response_type == "CONVERSATION"
                 and not tool_outcome
                 and reply
-                and _contains_stale_error_marker(reply)
+                and internal_marker_leak(reply, expanded_text)
             ):
                 logger.info(
                     "Conversation turn replayed a previous failure; "
                     "replaced with a neutral reply (chat=%s)", chat_id,
                 )
                 reply = _NEUTRAL_STALE_ERROR_REPLY
+            # FP-L06: this turn reports NO tool outcome, so nothing backs a
+            # claim that an instrument returned an output/error.  A reply that
+            # presents one anyway (invented, or a previous diagnosis replayed as
+            # current) gets an honest «не вызывала» answer instead of the text.
+            elif (
+                response_type == "CONVERSATION"
+                and not tool_outcome
+                and reply
+                and ungrounded_tool_output_claim(reply, ())
+            ):
+                logger.info(
+                    "Conversation turn presented an ungrounded tool-output "
+                    "claim; replaced with an honest reply (chat=%s)", chat_id,
+                )
+                reply = _UNGROUNDED_TOOL_OUTPUT_REPLY
+            # FP-L06b: the SAME turn's tool SUCCEEDED, yet the reply calls that
+            # tool broken.  The «Инструмент `X` выполнен: …» line is rendered
+            # from the real result, so the contradiction is unconditionally
+            # false — never shown (shared criterion, one place).
+            elif (
+                response_type == "CONVERSATION"
+                and tool_outcome == "SUCCEEDED"
+                and reply
+                and contradicts_a_successful_tool(reply)
+            ):
+                logger.info(
+                    "Conversation turn claimed a tool that succeeded is "
+                    "broken; replaced with an honest reply (chat=%s)", chat_id,
+                )
+                reply = _UNGROUNDED_TOOL_BREAKAGE_REPLY
             is_refusal = (
                 bool(reply)
                 and (
@@ -2734,6 +2781,7 @@ class TelegramBot(TelegramTransport):
 
         deadline = time.monotonic() + budget
         last_text = "Задача выполняется…"
+        last_status: FlowStatus | None = None
         while time.monotonic() < deadline:
             try:
                 flow = await self.gateway_client.get_flow(flow_id)
@@ -2746,6 +2794,11 @@ class TelegramBot(TelegramTransport):
             if status is None:
                 await asyncio.sleep(0.5)
                 continue
+
+            # Remember the REAL observed status: the budget may expire while the
+            # flow is parked on the owner's decision, and that must be reported
+            # as such (never a blanket RUNNING, never silence) — FP-L03d.
+            last_status = status
 
             if status in (FlowStatus.WAITING_APPROVAL, FlowStatus.WAITING_USER):
                 try:
@@ -2865,9 +2918,20 @@ class TelegramBot(TelegramTransport):
             last_text = f"Задача выполняется: {status.value}"
             await asyncio.sleep(0.5)
 
+        # The budget expired while the flow is still open.  Report the REAL
+        # observed status (never a blanket RUNNING) and an honest text, so the
+        # owner is told the task is parked on their decision instead of getting
+        # nothing at all (FP-L03d).
+        if last_status in (FlowStatus.WAITING_APPROVAL, FlowStatus.WAITING_USER):
+            return (
+                "Задача ждёт вашего решения (одобрение или уточнение) — "
+                "она не завершена.",
+                _open_operation_state(last_status),
+                False,
+            )
         return (
             last_text + " — выполнение продолжается, результат придёт позже.",
-            OperationState.RUNNING,
+            _open_operation_state(last_status),
             False,
         )
 

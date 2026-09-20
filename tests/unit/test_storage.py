@@ -285,7 +285,7 @@ def test_alembic_upgrade_head_creates_schema_and_triggers(tmp_path: object) -> N
     masked = upgrade_to_head(f"sqlite:///{db_path}")
 
     assert masked.startswith("sqlite+aiosqlite:///")
-    assert head_revision() == "0003_goal_autonomy"
+    assert head_revision() == "0004_delivery_readback"
 
     connection = sqlite3.connect(db_path)
     try:
@@ -298,6 +298,6 @@ def test_alembic_upgrade_head_creates_schema_and_triggers(tmp_path: object) -> N
         version = connection.execute("SELECT version FROM schema_version").fetchone()
         assert version[0] == SCHEMA_VERSION
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert revision[0] == "0003_goal_autonomy"
+        assert revision[0] == "0004_delivery_readback"
     finally:
         connection.close()

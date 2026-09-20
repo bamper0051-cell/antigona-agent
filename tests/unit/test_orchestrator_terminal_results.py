@@ -140,7 +140,11 @@ def test_orchestrator_persists_sanitized_stdout_and_verifier_alone_reaches_done(
     raw = "42 workspace/file.txt\nAPI_KEY=synthetic-api-key"
     shell = RecordingShell(ToolResult(True, "completed", {"output": raw}))
     task_id = create_shell_task(database, command=("wc", "-c", "workspace/file.txt"))
-    expected = sanitize_result_text(raw)
+    # FP-L23: the durable stdout artifact is the EFFECT TRACE and keeps the
+    # command's line structure (the chat-facing step projection still collapses
+    # newlines for rendering). The seeded criteria therefore describe the
+    # newline-preserving projection the verifier reads back.
+    expected = sanitize_result_text(raw, preserve_newlines=True)
     assert expected is not None
     seed_private_criteria(
         database.engine.url.render_as_string(hide_password=False),
@@ -175,6 +179,10 @@ def test_orchestrator_persists_sanitized_stdout_and_verifier_alone_reaches_done(
         assert task.steps[0].output is not None
         assert task.artifacts[0].path.startswith(".antigona-results/")
         assert task.artifacts[0].verified is True
+        # FP-L23: the artifact keeps the command's line structure (the effect
+        # trace), while the chat-facing projection above stays collapsed.
+        artifact_text = (workspace / task.artifacts[0].path).read_text(encoding="utf-8")
+        assert "\n" in artifact_text and artifact_text.splitlines()[0].startswith("42 ")
         done = [t for t in task.transitions if t.to_state == TaskState.DONE.value]
         assert len(done) == 1
         assert done[0].actor == "verifier-service"

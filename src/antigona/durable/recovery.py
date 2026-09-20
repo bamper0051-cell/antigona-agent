@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import QueueJob, StateTransition, TaskFlow, TaskState, utcnow
-from .state_machine import TERMINAL_STATES
+from .state_machine import OBSERVATION_ENTITY_TYPE, TERMINAL_STATES
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,10 @@ class RecoveryWorker:
                 StateTransition(
                     task_id=task.id,
                     entity_id=task.id,
-                    entity_type="lease",
+                    # FP-L02: reclaiming an expired lease is not a state change
+                    # (the task keeps the state it was found in), so it is an
+                    # OBSERVATION, not a fabricated ``X -> X`` transition.
+                    entity_type=OBSERVATION_ENTITY_TYPE,
                     from_state=task.status,
                     to_state=task.status,
                     reason=f"expired lease reclaimed from {task.lease_owner}",
