@@ -43,6 +43,7 @@ from .result_safety import (
 from .security import verifier_credential
 from .skills import SkillIntegrityError, SkillsRegistry, SkillState
 from .verifier import (
+    EffectContext,
     HTTPVerifierProvider,
     LLMJudge,
     MissingVerifierCriteria,
@@ -317,6 +318,214 @@ def _tool_result_preview(task: TaskFlow) -> str:
         return ""
 
 
+# ── FP-L01b (P0): the structural fast path needs the CONTENT, not the shape ──
+#
+# The structural branch below is the only route that can finalize DONE without
+# the independent judge, so it may stand in for the judge EXCLUSIVELY where the
+# artifact's content has been compared with the intent of the goal. "The file
+# exists, it is non-empty and its hash matches the recorded one" is a shape, not
+# an effect: a tool that wrote a different body (the live probe: a write of
+# ``noise_probe.txt`` whose content was never compared with the requested word
+# ``signal``) is structurally perfect.
+#
+# Exactly three shapes qualify. Each one is covered by a test and each one is a
+# case of "the intent is known and was compared":
+#
+#   1. A READ artifact (`is_read_tool` on a non-write intent, e.g.
+#      ``intent == file_read``). The requested effect of a read IS the content of
+#      the named file and the artifact of a read step IS that file, so the
+#      intent is trivially the artifact itself. The identity is re-proved
+#      instead of assumed: ``_read_artifact_matches_goal_path`` re-reads the
+#      goal-named path through the same no-follow descriptor reader and demands
+#      byte equality, so a read artifact that is NOT the goal-named file (a
+#      different path the goal merely mentions) fails closed to the judge.
+#   2. A WRITE whose body the goal states. ``deterministic_expected_content``
+#      extracts that literal; the comparison a few lines above has already
+#      returned on a mismatch, so arriving at the structural branch PROVES the
+#      artifact content equals the goal's stated intent.
+#   3. A WRITE whose body is an explicit contract. When the goal states no body,
+#      ``task.content`` is the submitted contract (a caller-drafted body on the
+#      explicit submit surfaces, or the free-text resolver's own result) and
+#      byte equality with it is the only expressible intent. The free-text path
+#      can never reach this shape with an unstated body: ``resolve_free_text_
+#      request`` reports ``write_content_not_derivable`` as answer-only.
+#
+# A COMPOUND write→read artifact is judged by #2/#3: the presence of a read step
+# never authorizes a structural DONE for the written body by itself. That
+# authorization was the defect — it certified a substituted write body as an
+# effect on the strength of an afterwards read-back of the same file.
+_WRITE_INTENTS = (
+    "file_write",
+    "file_write_read",
+    "file_write_run",
+    "file_write_fix_run",
+    "multi_file",
+)
+
+
+def _normalize_artifact_path(value: object) -> str:
+    """Normalize a workspace-relative artifact path for identity comparison."""
+    text = str(value or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def _read_artifact_matches_goal_path(
+    workspace: Path, plan_path: object, artifact_path: object, data: bytes
+) -> bool:
+    """Prove a read artifact really is the file the goal named (FP-L01b).
+
+    Returns ``True`` only when the artifact path is the goal's own read path AND
+    the bytes read back from that path equal the artifact bytes. Every failure
+    (a different path, an unreadable/linked/oversized target, a size change)
+    returns ``False`` — the caller then falls through to the judge instead of
+    granting a structural DONE on shape alone.
+    """
+    target = _normalize_artifact_path(plan_path)
+    actual = _normalize_artifact_path(artifact_path)
+    if not target or not actual or target != actual:
+        return False
+    try:
+        return read_artifact_safely(workspace, actual, len(data)) == data
+    except OSError:
+        return False
+
+
+#: FP-L23 — the secondary judge is an independent model: it can only judge what
+#: it is handed. A bare artifact read-back is not enough for it to relate the
+#: artifact to the requested effect, and it then fails closed with "Artifact
+#: content not provided" (live witness ``fa6e102b``: a real ``ls | head -2``
+#: run, a hash-valid artifact, FAILED anyway, while sibling tasks of the same
+#: shape passed). The judge is therefore handed the artifact content labelled
+#: (see ``verifier.judge.HTTPVerifierProvider.build_prompt``) plus the verbatim
+#: execution facts recorded on the step.
+_JUDGE_CONTEXT_MARKER = "...[truncated]"
+#: Bound for the whole report handed to the judge. Each part is already bounded
+#: by the result-safety projection (4096), so this only guards the envelope.
+_JUDGE_CONTEXT_LIMIT = 16_384
+
+
+def _bounded_judge_context(text: str, max_length: int = _JUDGE_CONTEXT_LIMIT) -> str:
+    """Bound the judge report, marking the cut explicitly."""
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - len(_JUDGE_CONTEXT_MARKER)] + _JUDGE_CONTEXT_MARKER
+
+
+#: FP-L23S — owner-facing ceiling for a materialized shell stdout trace. The
+#: owner reads the command's own output, bounded, with the explicit truncation
+#: marker — never the raw artifact blob glued into one token.
+_OPERATOR_STDOUT_LIMIT = 3500
+
+
+def _operator_stdout_message(content: str, command: str) -> str:
+    """Label a materialized shell stdout trace for the owner chat (FP-L23S).
+
+    The live result message was the artifact read-back verbatim. With the
+    newlines destroyed upstream (FP-L23R) the owner received
+    ``DONE — 026007e0-…c42b``: an unreadable 72-character blob that says
+    nothing about what ran. Naming the command the output came from, bounded
+    and explicit about the cut, is what makes the result readable.
+    """
+    body = _bounded_judge_context(content, _OPERATOR_STDOUT_LIMIT).strip()
+    header = f"Вывод команды {command}:" if command else "Вывод команды:"
+    return f"{header}\n{body}"
+
+
+def _effect_command(task: TaskFlow) -> str:
+    """The argv the task was actually executed with, as one readable line."""
+    arguments = task.tool_arguments or {}
+    raw = arguments.get("command") or arguments.get("argv")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, (list, tuple)) and raw:
+        parts = [str(part) for part in raw]
+        if len(parts) >= 3 and parts[1] in ("-c", "-lc"):
+            return f"{parts[0]} -c {parts[2]!r}"
+        return " ".join(parts)
+    return ""
+
+
+def _recorded_effect_facts(task: TaskFlow) -> dict[str, str]:
+    """Verbatim execution facts recorded on the step that performed the effect.
+
+    Only a **completed, not withheld** tool result counts: a failed, blocked, or
+    ``text_omitted`` projection is not effect evidence, so it yields ``{}`` and
+    the caller keeps failing closed. The facts are the step's own durable
+    record (never an assertion about success) — the judge remains the decider.
+    """
+    try:
+        steps = list(task.steps or [])
+    except Exception:  # pragma: no cover — defensive: unloaded relationship
+        return {}
+    for step in reversed(steps):
+        projection = (step.output or {}).get("tool_result") or {}
+        if not isinstance(projection, dict) or not projection:
+            continue
+        if (
+            projection.get("ok") is not True
+            or projection.get("blocked") is True
+            or projection.get("text_omitted") is True
+        ):
+            continue
+        step_input = step.input or {}
+        tool = str(
+            step.tool_name or step_input.get("tool_name") or task.tool_name or ""
+        )
+        # FP-L23R: a materialized stdout artifact records the faithful trace
+        # (newlines kept) as ``effect_stdout``; ``stdout_preview`` is the
+        # chat-oriented projection and collapses newlines by design. Prefer the
+        # faithful trace so the judge is never handed a glued token that
+        # contradicts the artifact.
+        output = step.output or {}
+        faithful_stdout = output.get("effect_stdout")
+        stdout = (
+            faithful_stdout
+            if isinstance(faithful_stdout, str) and faithful_stdout
+            else projection.get("stdout_preview")
+        )
+        target = projection.get("path") or step_input.get("path")
+        facts = {
+            "tool": tool,
+            "command": _effect_command(task),
+            "status": str(projection.get("status") or ""),
+            "stdout": stdout if isinstance(stdout, str) else "",
+            "target": str(target) if isinstance(target, str) else "",
+        }
+        if facts["stdout"] or facts["tool"] or facts["target"]:
+            return facts
+    return {}
+
+
+def _effect_context(
+    task: TaskFlow,
+    *,
+    artifact_path: str,
+    sha256: str,
+    size: int,
+    content_usable: bool = True,
+) -> EffectContext:
+    """The FP-L23 effect report for the judge: artifact identity + execution facts.
+
+    The recorded stdout is reported only when the step really completed without
+    withholding its output (``_recorded_effect_facts``); a tool target path is
+    reported instead for tools whose effect is a file rather than stdout.
+    """
+    facts = _recorded_effect_facts(task)
+    recorded = facts.get("stdout", "") or facts.get("target", "")
+    return EffectContext(
+        artifact_path=artifact_path,
+        artifact_size=size,
+        artifact_sha256=sha256,
+        tool=facts.get("tool", ""),
+        command=facts.get("command", ""),
+        status=facts.get("status", ""),
+        recorded_stdout=_bounded_judge_context(recorded),
+        artifact_content_usable=content_usable,
+    )
+
+
 def create_verifier_app(
     database_url: str | None = None,
     credential: str | None = None,
@@ -494,6 +703,144 @@ def create_verifier_app(
             computed_sha = hashlib.sha256(data).hexdigest()
             if computed_sha != artifact.sha256:
                 return reject(session, task, body, "artifact hash mismatch")
+
+            # 1c. P0 false-DONE machine (live defect 2026-09-18): a non-empty
+            # artifact is NOT evidence of the requested effect. Three
+            # fail-closed invariants, all derived from the goal's canonical
+            # plan (the same resolution POST /tasks and the planner use):
+            #   * an answer-only task declares that it performs NO side effect
+            #     — nothing about it may be verified as a completed effect;
+            #   * the executed tool must be the tool the canonical plan
+            #     requires (a shell/read goal executed as a workspace write has
+            #     not performed the requested effect);
+            #   * a write artifact whose body is verbatim the request text is
+            #     the request written back (the degraded fallback), not the
+            #     requested effect.
+            from antigona.task_goal import (
+                ANSWER_ONLY_TOOL,
+                LEGACY_DEFAULT_TARGET,
+                NO_EFFECT_REASONS,
+                TYPED_EFFECT_INTENTS,
+                WRITE_EFFECT_INTENTS,
+                canonical_tool_name,
+                resolve_free_text_request,
+            )
+
+            _task_arguments = task.tool_arguments or {}
+            if (
+                _task_arguments.get("answer_only") is True
+                or str(task.tool_name or "") == ANSWER_ONLY_TOOL
+            ):
+                emit_outcome("verifier.false_done_answer_only", body, "rejected", task)
+                return reject(
+                    session,
+                    task,
+                    body,
+                    "task is answer-only: it performs no side effect, so no "
+                    "artifact can prove the requested effect",
+                )
+            _canonical_request = resolve_free_text_request(task.goal or "")
+            _executed_tool = str(task.tool_name or "") or next(
+                (str(s.tool_name) for s in task.steps if s.tool_name), ""
+            )
+            # FP-L05d: write aliases (``workspace.write`` is the capability
+            # registry id) are the SAME tool as ``workspace.write_text``. Both
+            # sides of every comparison below are canonicalised, so an alias can
+            # neither look like a different tool nor walk past the self-write
+            # guard.
+            _executed_canonical = canonical_tool_name(_executed_tool)
+            _plan_canonical = canonical_tool_name(_canonical_request.tool_name)
+            # Only a plan for a SINGLE effect tool constrains the executed tool:
+            # a compound ``multi_file`` plan (create these files, then the
+            # summary) is executed by workspace writes as well as by a shell
+            # plan, and its requested effect — every named file — is enforced
+            # by the required-files check below. Typed-param intents
+            # (mcp/email/tts) resolve to their own tool by design, and a plan
+            # that declares no effect is handled above/below.
+            if (
+                _plan_canonical
+                in ("sandbox.shell", "workspace.read_text", "workspace.write_text")
+                and _canonical_request.intent != "multi_file"
+                and _executed_tool
+                and _plan_canonical != _executed_canonical
+            ):
+                emit_outcome("verifier.false_done_executed_tool_mismatch", body, "rejected", task)
+                return reject(
+                    session,
+                    task,
+                    body,
+                    "executed tool "
+                    f"{_executed_tool!r} does not implement the goal's plan tool "
+                    f"{_canonical_request.tool_name!r}: the requested effect was "
+                    "not performed",
+                )
+            _goal_text = (task.goal or "").strip()
+            # The observable witness is the artifact itself: it must literally
+            # BE the request text (the degraded fallback), while the goal's
+            # canonical plan never asked for a write. Metadata alone
+            # (task.content) is not enough — and metadata plus a real artifact
+            # (e.g. a binary produced by an mcp/tts tool) is not this defect.
+            _artifact_text = data.decode("utf-8", errors="replace").strip()
+            if (
+                _goal_text
+                and _artifact_text == _goal_text
+                and _executed_canonical == "workspace.write_text"
+                and _plan_canonical != "workspace.write_text"
+            ):
+                emit_outcome("verifier.false_done_self_write", body, "rejected", task)
+                return reject(
+                    session,
+                    task,
+                    body,
+                    "artifact is the request text written back verbatim "
+                    "(self-write); the requested effect was not performed",
+                )
+
+            # 1d (FP-L05b). The witness above is exact-equality only, so a model
+            # that answered an ACTION request with PROSE instead of running it
+            # stored its refusal in the artifact and still reached DONE — live
+            # witnesses 0608fc9e / 9ef403b1 / b03711b2: the artifact was the
+            # model's own text, never equal to the goal.
+            #
+            # Scope (deliberately narrow — over-firing here rejects working
+            # tasks):
+            #   * only a `workspace.write_text` EXECUTION is judged; a plan that
+            #     resolves to its own tool is covered by 1c;
+            #   * the trigger is the goal parser PROVING no effect is
+            #     materializable (an unresolvable shell command, a read with no
+            #     named file) — NOT the generic bucket-4 fallthrough, which also
+            #     fires for conversations, questions and typed-parameter
+            #     requests. Treating that fallthrough as proof rejected every
+            #     legitimate write task whose goal the text parser reads as a
+            #     plain sentence ("publish") and every MCP/e-mail/TTS task;
+            #   * canonical write plans are untouched: the plan IS a write and
+            #     the body may legitimately be drafted by the model;
+            #   * typed-parameter intents are untouched for the same reason;
+            #   * an EXPLICIT structured contract is untouched: a flow that
+            #     names its own target (POST /flows with path+content) owns its
+            #     intent, and the free-text parser is not authoritative for it.
+            #     Only a write to the removed unscoped default target can be the
+            #     degraded "store the request in a file" shape.
+            if (
+                _executed_canonical == "workspace.write_text"
+                and _plan_canonical != "workspace.write_text"
+                and _canonical_request.reason in NO_EFFECT_REASONS
+                and _canonical_request.intent not in WRITE_EFFECT_INTENTS
+                and _canonical_request.intent not in TYPED_EFFECT_INTENTS
+                and str(task.target_path or "") == LEGACY_DEFAULT_TARGET
+            ):
+                emit_outcome(
+                    "verifier.false_done_write_for_non_write_plan", body, "rejected", task
+                )
+                return reject(
+                    session,
+                    task,
+                    body,
+                    "the goal's canonical plan prescribes no workspace write "
+                    f"(resolved as {_canonical_request.intent!r}: "
+                    f"{_canonical_request.reason}); a file write cannot "
+                    "implement the requested effect",
+                )
 
             # 1b. D10 fail-closed: literal path constraints from the goal must
             # be satisfied by the verified artifact. A read/write of the WRONG
@@ -746,6 +1093,10 @@ def create_verifier_app(
 
             # 3. Structural evidence is mandatory regardless of model approval.
             actual_text = data.decode(errors="replace")
+            # FP-L23: the execution facts of the step that ran the effect. They
+            # are handed to the judge (never asserted as success) so a real
+            # effect cannot be rejected as "content not provided".
+            effect_facts = _recorded_effect_facts(task)
             if _looks_binary(data):
                 # Binary artifacts (e.g. TTS mp3) cannot be judged as text —
                 # fall back to the tool's text summary (stdout_preview).
@@ -761,7 +1112,8 @@ def create_verifier_app(
             # materialized run stdout (.antigona-results/<task>.txt), whose
             # "stdout:\n…\n\nexit code:\n0" layout carries meaning in its line
             # breaks. Collapsing them would deliver "stdout:144.0exit code:0",
-            # which canon forbids. Plain shell stdout-only tasks are unchanged.
+            # which canon forbids. FP-L23 extends the same rule to EVERY
+            # materialized stdout artifact (a plain ``sandbox.shell`` trace).
             from antigona.task_goal import parse_goal as _pg_result
 
             _goal_intent = str(getattr(_pg_result(task.goal or ""), "intent", ""))
@@ -769,16 +1121,44 @@ def create_verifier_app(
                 _goal_intent == "file_write_fix_run"
                 and str(artifact.path or "").replace("\\", "/").startswith(".antigona-results/")
             )
+            # FP-L01b: set inside the fix-run postcondition block below; a flow
+            # that is not a fix-run never derives this postcondition.
+            _fix_run_postcondition_present = False
             _run_stdout_artifact = (
                 _goal_intent in ("file_write_run", "file_write_fix_run")
                 and str(artifact.path or "").replace("\\", "/").startswith(".antigona-results/")
             )
+            # FP-L23: EVERY materialized stdout artifact (also a plain
+            # ``sandbox.shell`` one) carries the effect trace in its line
+            # structure — the two lines of ``ls | head -2`` are exactly what
+            # makes the artifact judgeable. Collapsing them here handed the
+            # judge an opaque 72-character token and it failed a real effect.
+            _stdout_artifact = (
+                str(artifact.path or "").replace("\\", "/").startswith(".antigona-results/")
+            )
             safe_actual_text = sanitize_result_text(
                 actual_text,
-                preserve_newlines=is_read_tool or _run_stdout_artifact,
+                preserve_newlines=is_read_tool or _run_stdout_artifact or _stdout_artifact,
             )
-            if not isinstance(safe_actual_text, str) or not is_usable_result_text(safe_actual_text):
-                return reject(session, task, body, "artifact contains no usable result text")
+            artifact_text_usable = is_usable_result_text(safe_actual_text)
+            if not isinstance(safe_actual_text, str) or not artifact_text_usable:
+                # FP-L23: the artifact read-back may carry no judgeable text
+                # (binary media, a projection that is only whitespace). The
+                # step's own recorded tool output IS the effect trace, so judge
+                # that instead of substituting a rejection for a missing
+                # content — but only when it was recorded as a completed,
+                # not-withheld result. With neither the artifact nor a
+                # completed tool result carrying text there is nothing to
+                # judge: fail closed.
+                recorded_text = effect_facts.get("stdout", "")
+                if not is_usable_result_text(recorded_text):
+                    return reject(session, task, body, "artifact contains no usable result text")
+                safe_actual_text = sanitize_result_text(
+                    recorded_text, preserve_newlines=True
+                ) or ""
+                if not is_usable_result_text(safe_actual_text):
+                    return reject(session, task, body, "artifact contains no usable result text")
+                artifact_text_usable = False
 
             # R1-B01: a fix-run's contract is that the *rerun* now works and
             # prints the requested answer. Structural evidence (hash + non-empty)
@@ -814,6 +1194,13 @@ def create_verifier_app(
                         f"postcondition (expected {_expected_token!r} as a "
                         "standalone value)",
                     )
+                # FP-L01b: the rerun's contract is "the defect is resolved".
+                # Only a DERIVED postcondition may authorize the structural
+                # branch: the goal's own expected value (checked above) or the
+                # rerun's clean exit trailer. A goal that states neither leaves
+                # the intent undeterminable, so the artifact goes to the judge
+                # instead of a structural DONE (fail-closed).
+                _fix_run_postcondition_present = bool(_expected_token) or _exit_code == 0
 
             # P0-031 FALSE_DONE guard: если из goal формально вычисляется точное
             # содержимое файла — фактический артефакт ОБЯЗАН совпасть с ним.
@@ -869,19 +1256,60 @@ def create_verifier_app(
                     write_content_matches = data == task.content.encode("utf-8")
                 except UnicodeEncodeError:
                     write_content_matches = False
-            is_structural = is_read_tool or (
+            # FP-L01b (P0): the structural fast path is authorized ONLY by a
+            # content-vs-intent comparison — never by the artifact's shape. See
+            # the "FP-L01b" note above ``_WRITE_INTENTS`` for the three shapes
+            # that legitimately qualify and why each one is the intent.
+            #
+            #   * ``_read_intent_verified``      — a READ artifact whose bytes
+            #     are the bytes of the file the goal names (shape 1);
+            #   * ``expected_content``           — the goal STATES the body and
+            #     the comparison above already proved the artifact equals it
+            #     (shape 2);
+            #   * ``write_content_matches``      — an explicit write contract
+            #     whose body equals the artifact byte-for-byte (shape 3);
+            #   * ``_fix_run_postcondition_present`` — the fix-run's own derived
+            #     postcondition (expected value / clean exit trailer).
+            #
+            # A COMPOUND write→read flow is a WRITE: a read step in the plan must
+            # NOT authorize a structural DONE for the written body (that was the
+            # defect — it certified a substituted body as an effect).
+            _read_intent_verified = (
+                is_read_tool
+                and str(getattr(_plan, "intent", "")) not in _WRITE_INTENTS
+                and _read_artifact_matches_goal_path(
+                    workspace,
+                    getattr(_plan, "path", ""),
+                    artifact.path,
+                    data,
+                )
+            )
+            _goal_stated_body_verified = bool(expected_content)
+            _write_intent_verified = _goal_stated_body_verified or write_content_matches
+            is_structural = _read_intent_verified or (
                 not is_test_judge
                 and (
-                    _is_fix_run_stdout
-                    or write_content_matches
+                    (_is_fix_run_stdout and _fix_run_postcondition_present)
+                    or _write_intent_verified
                 )
             )
             if is_structural:
-                _safe_read_reason = (
-                    "fix-run rerun stdout verified structurally (hash+non-empty)"
-                    if _is_fix_run_stdout
-                    else "read artifact verified structurally (hash+non-empty)"
-                )
+                if _read_intent_verified:
+                    _safe_read_reason = (
+                        "read artifact matches the goal's intent: content equals "
+                        "the goal-named file (hash+bytes)"
+                    )
+                elif _is_fix_run_stdout:
+                    _safe_read_reason = (
+                        "fix-run rerun stdout satisfies the goal's derived "
+                        "postcondition (exit code / expected value)"
+                    )
+                else:
+                    _safe_read_reason = (
+                        "write artifact matches the goal's intent: content equals "
+                        "the goal-stated body or the explicit write contract "
+                        "(hash+bytes)"
+                    )
                 result = session.execute(
                     update(TaskFlow)
                     .where(
@@ -939,6 +1367,12 @@ def create_verifier_app(
                         msg_parts.append(f"creator_tool: {creator_tool_val}")
                     msg_parts.append(f"content:\n{safe_actual_text}")
                     delivery_message = "\n".join(msg_parts)
+                elif _stdout_artifact:
+                    # FP-L23S: a materialized shell stdout trace is delivered as
+                    # the command's own labelled output, never the raw blob.
+                    delivery_message = _operator_stdout_message(
+                        safe_actual_text, _effect_command(task)
+                    )
                 else:
                     delivery_message = safe_actual_text
                 for channel in result_channels:
@@ -992,6 +1426,13 @@ def create_verifier_app(
                     goal=task.goal,
                     criteria=criteria,
                     actual_content=safe_actual_text,
+                    effect_context=_effect_context(
+                        task,
+                        artifact_path=str(artifact.path or ""),
+                        sha256=artifact.sha256,
+                        size=artifact.size,
+                        content_usable=artifact_text_usable,
+                    ),
                     evidence={"sha256": artifact.sha256},
                 )
             except MissingVerifierCriteria:
@@ -1097,6 +1538,13 @@ def create_verifier_app(
                     msg_parts.append(f"creator_tool: {creator_tool_val}")
                 msg_parts.append(f"content:\n{safe_actual_text}")
                 delivery_message = "\n".join(msg_parts)
+            elif _stdout_artifact:
+                # FP-L23S: the owner gets the command's own output lines, named
+                # and bounded — never the raw artifact blob glued into one
+                # identifier (the live message was ``DONE — 026007e0-…c42b``).
+                delivery_message = _operator_stdout_message(
+                    safe_actual_text, _effect_command(task)
+                )
 
             for channel in result_channels:
                 session.add(

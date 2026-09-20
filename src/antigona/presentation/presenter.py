@@ -168,6 +168,34 @@ def _terminal_state(value: str | OperationState) -> OperationState | None:
     return state if StateMachine.is_terminal(state) else None
 
 
+#: What the owner must hear when a turn reports an outcome that is NOT terminal.
+#: A nonterminal outcome can never be committed as a final — the work is still
+#: open and the real final has to stay deliverable — but silently dropping the
+#: message leaves the chat looking as if the request had vanished (live FP-L03d:
+#: the wait budget expired while the flow was WAITING_APPROVAL, the presenter
+#: refused the nonterminal final and the owner received nothing at all).  The
+#: owner is told the truth about the state instead, while the internal warning
+#: stays in the journal.
+_OPEN_STATE_TEXT: dict[str, str] = {
+    "WAITING_APPROVAL": (
+        "⏳ Жду одобрения владельца: команда требует подтверждения — "
+        "отправьте /approve, когда придёт карточка."
+    ),
+    "WAITING_USER": (
+        "⏳ Жду вашего решения: задача ждёт вашего ответа или одобрения — "
+        "отправьте /approve, когда придёт карточка."
+    ),
+    "PAUSED": "⏳ Задача приостановлена и ждёт решения владельца.",
+    "BLOCKED": "⏳ Задача ждёт решения по безопасности: нужен /approve владельца.",
+}
+_OPEN_STATE_DEFAULT = "⏳ Задача ещё выполняется — результат пришлю отдельным сообщением."
+
+
+def _open_operation_text(raw_state: str) -> str:
+    """Return the honest owner-facing text for a nonterminal outcome."""
+    return _OPEN_STATE_TEXT.get(raw_state.strip().upper(), _OPEN_STATE_DEFAULT)
+
+
 def _safe_untrusted(value: object | None, *, max_length: int) -> str:
     sanitized = sanitize_result_text(value, max_length=max_length, preserve_newlines=True) or ""
     sanitized = _SENSITIVE_PATH_RE.sub("\u2026", sanitized)
@@ -223,6 +251,9 @@ class OperationPresenter:
         self._last_edit_time: dict[int, float] = {}
         self._unsubscribers: list[Callable[[], None]] = []
         self._operation_locks: dict[str, asyncio.Lock] = {}
+        #: Last nonterminal state already reported to the owner, per operation —
+        #: an interim notice must never be repeated for the same open state.
+        self._open_notices: dict[str, str] = {}
         self._running = False
         # The presenter is the only component that puts bytes on the wire, so
         # it owns the allow-list rather than trusting whoever named the file.
@@ -347,10 +378,15 @@ class OperationPresenter:
         """
         intended = _terminal_state(event.terminal_state)
         if intended is None:
+            # A nonterminal outcome is not a final: nothing may be committed as
+            # terminal here and the real final must stay deliverable. The
+            # internal warning stays in the journal; the owner gets the honest
+            # state instead of silence (FP-L03d).
             logger.error(
                 "Rejected nonterminal final outcome for operation %s",
                 event.operation_id[:8],
             )
+            await self._deliver_open_operation_notice(event)
             return None
 
         async with self._lock_for(event.operation_id):
@@ -469,6 +505,76 @@ class OperationPresenter:
             return receipt
 
     # ── Final text delivery ──────────────────────────────────────────────
+
+    async def _deliver_open_operation_notice(self, event: FinalResponseReady) -> None:
+        """Tell the owner a NONTERMINAL turn is still open — never a fake final.
+
+        Delivered into the presenter-owned progress bubble when one exists (the
+        chat stays clean and the progress lifecycle is untouched); a plain
+        message is sent only when there is no bubble to edit.  No terminal status
+        is committed and no final manifest is written, so the real final of this
+        operation remains deliverable exactly once afterwards.
+        """
+        state_key = str(event.terminal_state or "").strip().upper()
+        text = _open_operation_text(state_key)
+        async with self._lock_for(event.operation_id):
+            if self._open_notices.get(event.operation_id) == state_key:
+                return
+            try:
+                data = await self._store.get(event.operation_id)
+            except Exception:
+                logger.exception(
+                    "Could not load operation for open-state notice %s",
+                    event.operation_id[:8],
+                )
+                return
+            chat_id = _get_chat_id(data)
+            if chat_id is None:
+                return
+            message_id = _get_message_id(data)
+            if message_id is not None:
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                except Exception as exc:
+                    # An unchanged bubble already carries the same honest text.
+                    if "NotModified" in type(exc).__name__:
+                        self._open_notices[event.operation_id] = state_key
+                        return
+                    logger.warning(
+                        "Open-state notice edit failed for operation %s",
+                        event.operation_id[:8],
+                    )
+                else:
+                    self._open_notices[event.operation_id] = state_key
+                    return
+            send_kwargs: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+            }
+            origin_message_id = _get_origin_message_id(data)
+            if origin_message_id is not None:
+                send_kwargs["reply_to_message_id"] = origin_message_id
+            try:
+                sent = await self._bot.send_message(**send_kwargs)
+            except Exception:
+                logger.exception(
+                    "Open-state notice send failed for operation %s",
+                    event.operation_id[:8],
+                )
+                return
+            if _sent_message_id(sent) is None:
+                logger.error(
+                    "Open-state notice returned no receipt for operation %s",
+                    event.operation_id[:8],
+                )
+                return
+            self._open_notices[event.operation_id] = state_key
 
     async def _send_final_chunks(
         self,
@@ -697,6 +803,7 @@ class OperationPresenter:
         )
 
     async def _cleanup_progress(self, operation_id: str) -> None:
+        self._open_notices.pop(operation_id, None)
         try:
             data = await self._store.get(operation_id)
         except Exception:

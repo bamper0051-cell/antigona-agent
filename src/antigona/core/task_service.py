@@ -24,7 +24,12 @@ from antigona.repository import (
     SensitiveTaskInput,
     TaskRepository,
 )
-from antigona.task_goal import expected_paths_from_goal, requires_exact_write_read_contract
+from antigona.task_goal import (
+    ANSWER_ONLY_TOOL,
+    expected_paths_from_goal,
+    requires_exact_write_read_contract,
+    resolve_free_text_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,21 +139,36 @@ class TaskSubmissionService:
                 )
 
         # LOOP3 / DEFECT 3: ``content is None`` означает «у вызывающей стороны
-        # нет черновика содержимого». Для workspace.write_text это degraded-режим
-        # (нет LLM-провайдера): тело файла деградирует до текста запроса, иначе
-        # offline-окружение вообще не сможет создать задачу (brain.py). Решение
-        # «отказать вместо записи инструкции» принимается ВЫШЕ — в мозге, где
-        # известно, сконфигурирован ли провайдер; здесь fallback остаётся, но он
-        # больше не молчаливый.
+        # нет черновика содержимого». FP-L05d: degraded-режим больше НЕ подставляет
+        # текст запроса как тело файла (живой дефект 4857f8d1 и машина ложного
+        # DONE). Тело РЕЗОЛВИТСЯ из самой цели каноническим резолвером; если тело
+        # из запроса не выводится — задача уходит в answer_only (fail-closed), а
+        # не записывает инструкцию в файл.
         resolved_content = content
         if resolved_content is None:
-            resolved_content = message
             if tool_name == "workspace.write_text":
-                logger.warning(
-                    "task submit without drafted content: falling back to the raw "
-                    "request text as file body (degraded mode, path=%s)",
-                    resolved_path or _DEFAULT_PATH,
-                )
+                request = resolve_free_text_request(message)
+                if request.tool_name == "workspace.write_text" and not request.answer_only:
+                    resolved_content = request.content or ""
+                    logger.warning(
+                        "task submit without drafted content: using the body named by "
+                        "the request itself (degraded mode, path=%s)",
+                        resolved_path or _DEFAULT_PATH,
+                    )
+                else:
+                    params = {**(params or {}), "answer_only": True}
+                    tool_name = ANSWER_ONLY_TOOL
+                    resolved_content = ""
+                    logger.warning(
+                        "task submit without drafted content and no derivable body: "
+                        "submitted as answer-only (degraded mode, path=%s, reason=%s)",
+                        resolved_path or _DEFAULT_PATH,
+                        request.reason,
+                    )
+            else:
+                # Non-write tools (shell/read/mcp/email) have no file body at all:
+                # the request text must never become one.
+                resolved_content = ""
 
         effective_read_after_write = read_after_write or requires_exact_write_read_contract(
             message, content=resolved_content, tool_name=tool_name

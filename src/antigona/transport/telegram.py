@@ -28,6 +28,7 @@ from aiogram.types import (
 )
 
 from antigona.gateway.circuit_breaker import GatewayCircuitBreaker
+from antigona.task_goal import resolve_submit_contract
 
 try:
     import fcntl
@@ -441,24 +442,45 @@ class TelegramTransport:
     async def post_flow(
         self,
         goal: str,
-        path: str = "task_output.txt",
-        content: str = "",
-        tool_name: str = "workspace.write_text",
+        path: str | None = None,
+        content: str | None = None,
+        tool_name: str | None = None,
         command: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Create a flow on the Gateway. Records success/failure on the circuit breaker."""
+        """Create a flow on the Gateway. Records success/failure on the circuit breaker.
+
+        FP-L05d: a bare free-text call (no target, no body, no tool) is resolved
+        by the canonical goal resolver — the removed defaults
+        ``path="task_output.txt"`` + ``tool_name="workspace.write_text"`` made
+        the bot submit a write of the request text for a goal that asked for
+        something else (a shell command, a conversation). Callers that name a
+        path/content/tool keep that explicit contract verbatim.
+        """
+        params: dict[str, Any] = {}
+        if tool_name is None and path is None and content is None:
+            contract = resolve_submit_contract(goal)
+            path = contract.path
+            content = contract.content or ""
+            tool_name = contract.tool_name
+            if contract.command:
+                command = list(contract.command)
+            if contract.answer_only:
+                params["answer_only"] = True
+        payload: dict[str, Any] = {
+            "goal": goal,
+            "path": path or "task_output.txt",
+            "content": content or "",
+            "tool_name": tool_name or "workspace.write_text",
+            "command": command or [],
+        }
+        if params:
+            payload["params"] = params
         idempotency_key = f"tg-flow-{int(time.time()*1000)}"
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     f"{self.gateway_url}/flows",
-                    json={
-                        "goal": goal,
-                        "path": path,
-                        "content": content,
-                        "tool_name": tool_name,
-                        "command": command or [],
-                    },
+                    json=payload,
                     headers=self._headers(idempotency_key),
                 )
                 resp.raise_for_status()

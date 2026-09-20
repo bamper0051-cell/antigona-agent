@@ -590,7 +590,7 @@ class WorkerAgentCore:
         from antigona.security.approval_grant import ApprovalGrantStore
 
         try:
-            verdict = ApprovalGrantStore().verify_and_consume(
+            verdict = ApprovalGrantStore().verify_and_consume_stored(
                 grant_token,
                 actor=str(getattr(approval, "decided_by", "") or ""),
                 tool_name=str(getattr(approval, "tool_name", "") or ""),

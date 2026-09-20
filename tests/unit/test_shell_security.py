@@ -64,11 +64,17 @@ def test_success_exposes_only_sanitized_stdout_and_never_stderr(
     assert "Traceback" not in repr(result)
 
 
-def test_single_string_argv_is_split_into_real_argv(
+def test_single_string_argv_becomes_a_container_shell_line(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LLM sends 'echo WIP-SHELL-CHECK' as one argv — split it via shlex."""
+    """LLM packs 'echo WIP-SHELL-CHECK' into one argv — it is a shell LINE.
+
+    FP-L03c: a packed element is the container shell's command line, so it must
+    reach the container as ``/bin/sh -c <line>`` byte-for-byte — never
+    ``shlex.split`` into argv (which the sandbox backend then re-quoted into
+    literals, killing ``$``, globs and substitutions).
+    """
     process = FakeProcess(b"WIP-SHELL-CHECK", b"", 0)
     popen_mock = MagicMock(return_value=process)
     monkeypatch.setattr(subprocess, "Popen", popen_mock)
@@ -78,11 +84,10 @@ def test_single_string_argv_is_split_into_real_argv(
 
     assert result.ok is True
     assert result.data == {"output": "WIP-SHELL-CHECK"}
-    # The underlying docker argv must contain the split binary, not the whole line.
+    # The docker argv must carry the command line UNSPLIT and UNQUOTED.
     spawned: list[str] = list(popen_mock.call_args.args[0])
-    assert "echo" in spawned
-    assert "WIP-SHELL-CHECK" in spawned
-    assert "echo WIP-SHELL-CHECK" not in spawned
+    assert spawned[-3:] == ["/bin/sh", "-c", "echo WIP-SHELL-CHECK"]
+    assert "'echo WIP-SHELL-CHECK'" not in spawned
 
 
 def test_nonzero_exit_returns_only_fixed_failure_without_stdout_or_stderr(
@@ -197,7 +202,10 @@ def test_recover_named_execution_success(
 
     assert res is not None
     assert res.ok is True
-    assert res.data == {"output": "recovered stdout"}
+    # FP-L23R: the recovered container's stdout keeps its line structure (the
+    # container wrote "recovered stdout\n"); this value is what the durable
+    # artifact and the verifier's effect facts are built from.
+    assert res.data == {"output": "recovered stdout\n"}
 
 
 def test_recover_named_execution_failure_on_nonzero_exit(

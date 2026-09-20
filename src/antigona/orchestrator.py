@@ -36,8 +36,10 @@ from .result_safety import (
     is_sensitive_execution,
     is_usable_result_text,
     project_tool_result,
+    sanitize_result_text,
 )
 from .shell import DockerShellTool, ShellInput
+from .task_goal import ANSWER_ONLY_TOOL, WRITE_TOOL_NAMES, canonical_tool_name
 from .tools.workspace_read import WorkspaceReadTextTool
 from .workspace import BaseWorkspace
 
@@ -488,7 +490,7 @@ class Orchestrator:
 
         # Atomically verify and consume the grant
         try:
-            verdict = ApprovalGrantStore().verify_and_consume(
+            verdict = ApprovalGrantStore().verify_and_consume_stored(
                 grant_token,
                 actor=str(approval.decided_by or "owner"),
                 tool_name=str(approval.tool_name),
@@ -656,6 +658,20 @@ class Orchestrator:
         if not isinstance(preview, str) or not is_usable_result_text(preview):
             return ToolResult(False, "failed", error="tool produced no safe result text")
         content = preview
+        # FP-L23: for a stdout-only tool (``sandbox.shell``, an MCP text result)
+        # the line structure of the output IS the effect trace — the projection
+        # deliberately collapses newlines for chat rendering, so re-project the
+        # raw stdout here with its newlines kept (exactly as the B5 run-stdout
+        # envelope already relies on its line breaks). A two-entry
+        # ``ls | head -2`` whose names glued into one 72-character token is no
+        # longer recognisable as the command's output: the verifier judge
+        # rejected that real, hash-valid effect as "Artifact content not
+        # provided" (live witness fa6e102b).
+        raw_output = result.data.get("output") if isinstance(result.data, dict) else None
+        if isinstance(raw_output, str) and "content" not in (result.data or {}):
+            faithful = sanitize_result_text(raw_output, preserve_newlines=True)
+            if isinstance(faithful, str) and is_usable_result_text(faithful):
+                content = faithful
         if include_exit_code:
             # B5: a write→run compound goal asks for the program stdout AND its
             # exit code; a stdout-only artifact loses half of the answer. The
@@ -664,7 +680,7 @@ class Orchestrator:
             # truthful fallback for a completed run.
             raw_code = result.data.get("exit_code", result.data.get("exit"))
             exit_code = str(raw_code) if raw_code is not None else "0"
-            content = f"stdout:\n{preview.rstrip()}\n\nexit code:\n{exit_code}\n"
+            content = f"stdout:\n{content.rstrip()}\n\nexit code:\n{exit_code}\n"
         result_path = f".antigona-results/{task.id}.txt"
         try:
             stored = self.tool.execute(WriteFileInput(path=result_path, content=content))
@@ -672,10 +688,19 @@ class Orchestrator:
             return ToolResult(False, "failed", error="safe result artifact unavailable")
         if not stored.ok or not stored.artifacts:
             return ToolResult(False, "failed", error="safe result artifact unavailable")
+        # FP-L23R: the artifact above holds the faithful effect trace, but the
+        # chat-oriented ``stdout_preview`` projection (result_safety) collapses
+        # newlines by design. Carry the faithful text next to the raw data so
+        # the step can persist it as ``effect_stdout`` — that is the record the
+        # verifier judges, and it must not disagree with the artifact (a glued
+        # duplicate next to the real trace is exactly the ambiguity that made
+        # the live verdict flip).
+        data: dict[str, Any] = dict(result.data) if isinstance(result.data, dict) else {}
+        data["stdout_faithful"] = content
         return ToolResult(
             True,
             "completed",
-            data=result.data,
+            data=data,
             artifacts=stored.artifacts,
         )
 
@@ -850,6 +875,11 @@ class Orchestrator:
                     correlation,
                     "recovered durable operation",
                     summary if isinstance(summary, dict) else None,
+                    effect_stdout=(
+                        stored_result.get("effect_stdout")
+                        if isinstance(stored_result.get("effect_stdout"), str)
+                        else None
+                    ),
                 )
                 last_artifact = art
                 continue
@@ -903,7 +933,33 @@ class Orchestrator:
             command = step_command or self._command(task)
             workspace_root = self._execution_workspace_root(task)
 
-            if step_tool_name == "send_email":
+            # `step_content` is the body the write branch below would use; it is
+            # bound here so no branch can read an unbound local.
+            step_content = self._step_content(typed)
+            if step_content is None:
+                step_content = task.content
+
+            # P0 false-DONE machine: a plan that declares NO side effect (an
+            # answer-only request — conversation/answer, an unresolvable shell
+            # command, a write whose content cannot be derived) must never
+            # execute a tool. The dispatch below used to fall through to the
+            # write branch for every unknown tool name, materializing an
+            # artifact — that is how a message became a "completed side
+            # effect". Fail closed instead: no artifact, and the failure reason
+            # names the evidence that does not exist.
+            if (
+                (task.tool_arguments or {}).get("answer_only") is True
+                or step_tool_name == ANSWER_ONLY_TOOL
+            ):
+                result = ToolResult(
+                    False,
+                    "failed",
+                    error=(
+                        "answer-only plan: no side effect requested; "
+                        "no artifact exists to verify"
+                    ),
+                )
+            elif step_tool_name == "send_email":
                 result = self._execute_send_email(task)
                 if result.ok:
                     initial_projection = project_tool_result(
@@ -1090,7 +1146,7 @@ class Orchestrator:
                         )
                 except Exception as exc:
                     result = ToolResult(False, "failed", error=f"tool execution failed: {exc}")
-            else:
+            elif step_tool_name in WRITE_TOOL_NAMES:
                 # Fail-closed guard (BUG ANT-002, P0 data loss): a write with
                 # empty content must never truncate an existing non-empty file.
                 # Read-intent tasks that degraded into write_text (empty content)
@@ -1104,7 +1160,7 @@ class Orchestrator:
                 if step_content is None:
                     step_content = task.content
                 if (
-                    step_tool_name == "workspace.write_text"
+                    canonical_tool_name(step_tool_name) == "workspace.write_text"
                     and not (step_content or "").strip()
                     and _target_nonempty
                 ):
@@ -1124,20 +1180,64 @@ class Orchestrator:
                         )
                     except Exception:
                         result = ToolResult(False, "failed", error="tool execution failed")
+            else:
+                # FP-L05d: the dispatch chain used to end in a bare ``else`` that
+                # executed a workspace write for ANY tool name — an unknown or
+                # aliased name (e.g. ``workspace.write``) produced an artifact and
+                # walked past the verifier's self-write guard (which looks for
+                # exactly ``workspace.write_text``). Unknown side-effect state is
+                # fail-closed: no tool runs, no artifact exists.
+                result = ToolResult(
+                    False,
+                    "failed",
+                    error=(
+                        f"unknown tool {step_tool_name!r}: refusing to execute "
+                        "(fail closed); no artifact exists"
+                    ),
+                )
 
             projection = project_tool_result(
                 result,
                 path=task.target_path,
                 command=command,
-                content=step_content if step_tool_name == "workspace.write_text" else task.content,
+                content=(
+                    step_content
+                    if canonical_tool_name(step_tool_name) == "workspace.write_text"
+                    else task.content
+                ),
                 workspace_root=workspace_root,
             )
-            typed.output = {
+            # FP-L23R: persist the faithful stdout trace of a materialized
+            # stdout artifact next to the chat-oriented projection. The
+            # projection flattens newlines by design (result_safety), so without
+            # this the verifier's recorded effect facts would describe a glued
+            # token while the artifact holds the real two-line output — two
+            # contradictory accounts of one effect, which is what made the
+            # judge's verdict unstable (FP-L23T).
+            _faithful_stdout = (
+                result.data.get("stdout_faithful")
+                if isinstance(result.data, dict)
+                else None
+            )
+            _step_output: dict[str, Any] = {
                 "ok": bool(result.ok and result.artifacts),
                 "side_effect_key": task.side_effect_key,
                 "tool_result": projection,
             }
-            operation.result = {"tool_result": projection}
+            _effect_stdout: str | None = (
+                _faithful_stdout
+                if isinstance(_faithful_stdout, str) and _faithful_stdout
+                else None
+            )
+            if _effect_stdout is not None:
+                _step_output["effect_stdout"] = _effect_stdout
+            typed.output = _step_output
+            _operation_result: dict[str, Any] = {"tool_result": projection}
+            if _effect_stdout is not None:
+                # Persist the faithful trace on the durable operation too, so a
+                # recovered APPLIED operation replays the same effect facts.
+                _operation_result["effect_stdout"] = _effect_stdout
+            operation.result = _operation_result
             operation.status = "PENDING" if result.ok and result.artifacts else "FAILED"
             operation.updated_at = utcnow()
             self.repository.commit()
@@ -1199,12 +1299,15 @@ class Orchestrator:
 
             produced = result.artifacts[0]
             operation.status = "APPLIED"
-            operation.result = {
+            _applied_result: dict[str, Any] = {
                 "path": produced.path,
                 "sha256": produced.sha256,
                 "size": produced.size,
                 "tool_result": projection,
             }
+            if _effect_stdout is not None:
+                _applied_result["effect_stdout"] = _effect_stdout
+            operation.result = _applied_result
             operation.updated_at = utcnow()
             self.repository.commit()
             art = self._persist_artifact(
@@ -1216,6 +1319,7 @@ class Orchestrator:
                 correlation,
                 "side effect completed",
                 projection,
+                effect_stdout=_effect_stdout,
             )
             last_artifact = art
 
@@ -1231,6 +1335,8 @@ class Orchestrator:
         correlation: str,
         reason: str,
         tool_result: dict[str, Any] | None,
+        *,
+        effect_stdout: str | None = None,
     ) -> Artifact:
         typed = step if isinstance(step, FlowStep) else task.steps[0]
         output: dict[str, Any] = {
@@ -1239,6 +1345,12 @@ class Orchestrator:
         }
         if tool_result is not None:
             output["tool_result"] = tool_result
+        if effect_stdout:
+            # FP-L23R: the faithful stdout trace of the materialized artifact.
+            # ``tool_result.stdout_preview`` is the chat projection and keeps no
+            # newlines, so the verifier reads this record for the real effect
+            # facts instead of judging a glued token.
+            output["effect_stdout"] = effect_stdout
         typed.output = output
         self.repository.transition_step(task, typed, StepState.COMPLETED, reason, "sandbox", correlation)
         artifact = Artifact(

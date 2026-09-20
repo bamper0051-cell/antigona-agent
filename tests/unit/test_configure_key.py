@@ -28,6 +28,11 @@ def _no_pin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("ANTIGONA_PIN", raising=False)
     monkeypatch.setenv("ANTIGONA_OWNER_ID", str(OWNER_ID))
     monkeypatch.setenv("ANTIGONA_AUDIT_DB_PATH", str(tmp_path / "test_audit.db"))
+    # The only writable root is the canonical workspace (A-CORE-001/A-00): a
+    # write outside it is refused, so these mechanics tests write inside it.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("ANTIGONA_WORKSPACE", str(workspace))
 
 
 class TestConfigureKeyParsing:
@@ -152,9 +157,9 @@ class TestConfigureKeyExecution:
         actions = [
             Action(
                 action_type=ActionType.WRITE_FILE,
-                path="/tmp/test.txt",
+                path="test.txt",
                 content="hello",
-                raw="WRITE_FILE|/tmp/test.txt|hello",
+                raw="WRITE_FILE|test.txt|hello",
             ),
             Action(
                 action_type=ActionType.CONFIGURE_KEY,

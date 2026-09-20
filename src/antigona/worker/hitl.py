@@ -170,6 +170,15 @@ def evaluate_risk(
             return RiskLevel.HIGH, f"Send secret file (exfil risk): {path}"
         return RiskLevel.MEDIUM, f"Send file outbound: {path}"
 
+    # 4c. An answer-only plan declares that it performs NO side effect (a
+    # conversation/answer, or an action whose effect cannot be materialized
+    # faithfully). It is LOW risk by construction: the orchestrator refuses to
+    # execute any tool for it, so it must not be parked in the approval queue.
+    from antigona.task_goal import ANSWER_ONLY_TOOL
+
+    if tool_name == ANSWER_ONLY_TOOL:
+        return RiskLevel.LOW, "Answer-only plan: no side effect requested"
+
     # Default fallback for unknown tools
     return RiskLevel.MEDIUM, f"Unknown tool execution: {tool_name}"
 

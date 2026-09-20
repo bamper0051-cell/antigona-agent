@@ -72,7 +72,7 @@ def home_dir() -> Path:
     """Current user's home directory, overridable via ``ANTIGONA_HOME_DIR``.
 
     Returns ``Path.home()`` by default (so behaviour on the canonical host with
-    ``HOME=/root`` is unchanged) and the ``~``-expanded value of
+    ``HOME=<host-root>`` is unchanged) and the ``~``-expanded value of
     ``ANTIGONA_HOME_DIR`` when that env var is set. Never a hardcoded personal
     path.
     """
@@ -80,6 +80,67 @@ def home_dir() -> Path:
     if raw:
         return Path(raw).expanduser()
     return Path.home()
+
+
+# ── Canonical HIGH-risk zone anchors (never derived from ambient HOME) ────────
+#
+# A risk zone must not be a function of the *process* environment.  A hardened
+# unit runs with ``HOME=/var/lib/antigona`` (its state root) while the deployment
+# it protects — the installed code root and the owner directory next to it —
+# lives under ``<host-root>``.  Deriving the HIGH zone from ``Path.home()`` therefore
+# REMOVED ``<host-root>/**`` from the protected set in exactly that configuration
+# (defect A-CORE-001: the same write was HIGH with ``HOME=<host-root>`` and MEDIUM with
+# the live unit's ``HOME``).  The anchors below are resolved from the canonical
+# deployment/state configuration instead, so an ambient ``HOME`` can only ever
+# ADD a zone (fail-closed), never shrink one.
+
+#: Env: ``os.pathsep``-separated list of extra HIGH-risk roots (operator intent).
+HIGH_RISK_ROOTS_ENV = "ANTIGONA_HIGH_RISK_ROOTS"
+
+
+def deployment_anchor_root() -> Path:
+    """Directory that owns the installed code root — the deployment anchor.
+
+    ``<host-root>`` for the canonical install at ``/opt/antigona-canon-*``, the owner
+    home in a normal development checkout.  Derived from the code root's real
+    location, never from ``Path.home()``.
+    """
+    return project_root().parent
+
+
+def security_anchor_roots() -> tuple[Path, ...]:
+    """Canonical HIGH-risk zone anchors, resolved WITHOUT the ambient ``HOME``.
+
+    Resolution order: every ``ANTIGONA_HIGH_RISK_ROOTS`` entry (explicit operator
+    intent), the deployment anchor (:func:`deployment_anchor_root`), the
+    canonical deployment/code root (:func:`project_root`), an explicitly
+    configured ``ANTIGONA_HOME_DIR`` and the configured runtime state root
+    (``ANTIGONA_STATE_ROOT``).  The filesystem root is refused: it would classify
+    every path on the host as HIGH.  Duplicates collapse; order is stable.
+    """
+    roots: list[Path] = []
+    raw = os.environ.get(HIGH_RISK_ROOTS_ENV)
+    if raw:
+        for part in raw.split(os.pathsep):
+            part = part.strip()
+            if part:
+                roots.append(Path(part).expanduser().resolve())
+    roots.append(deployment_anchor_root())
+    roots.append(project_root())
+    explicit_home = os.environ.get(HOME_DIR_ENV)
+    if explicit_home:
+        roots.append(Path(explicit_home).expanduser().resolve())
+    state_root = state_root_override()
+    if state_root is not None:
+        roots.append(state_root)
+
+    anchors: list[Path] = []
+    for root in roots:
+        if root == Path("/") or not str(root).strip():
+            continue
+        if root not in anchors:
+            anchors.append(root)
+    return tuple(anchors)
 
 
 def project_local_dir() -> Path:
@@ -97,7 +158,7 @@ def owner_dir_is_code_root() -> bool:
 
     ``owner_dir()`` (``Path.home()/'.antigona'``) is the owner-level *state*
     directory in a normal development/test environment.  In a host-root run
-    against a hardened install (``HOME=/root`` with the code root installed at
+    against a hardened install (``HOME=<host-root>`` with the code root installed at
     ``/var/lib/antigona``) it instead points at the immutable code checkout — the
     very directory the package is installed from.  Runtime state written there
     is exactly the read-only/write-class defect this module exists to prevent,

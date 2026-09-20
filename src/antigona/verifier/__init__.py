@@ -9,6 +9,7 @@ from __future__ import annotations
 from .anomaly import detect_trajectory_anomalies
 from .criteria import MissingVerifierCriteria, VerifierCriteriaDatabase, VerifierCriteriaStore
 from .judge import (
+    EffectContext,
     HTTPVerifierProvider,
     LLMJudge,
     ModelCollisionError,
@@ -26,6 +27,7 @@ from .skill_checks import (
 
 __all__ = [
     "DEFAULT_ALLOWED_TOOLS",
+    "EffectContext",
     "HTTPVerifierProvider",
     "LLMJudge",
     "MissingVerifierCriteria",

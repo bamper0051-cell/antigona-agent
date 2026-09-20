@@ -102,8 +102,15 @@ def _public_result_metadata(value: object, *, nested: bool = True) -> dict[str, 
 
 
 class TaskCreate(BaseModel):
-    goal:str=Field(min_length=1); path:str=Field(min_length=1); content:str
-    tool_name:Literal["workspace.write_text","workspace.read_text","sandbox.shell","mcp","send_email"]="workspace.write_text"
+    goal:str=Field(min_length=1)
+    #: FP-L05d: a submit that names NO tool and NO body of its own is FREE TEXT.
+    #: Its contract (tool/target/body) is resolved from the goal by the canonical
+    #: resolver (``resolve_submit_contract``); the removed preset combination
+    #: ``path="task_output.txt"`` + ``content=<request text>`` +
+    #: ``tool_name="workspace.write_text"`` was the false-DONE machine.
+    path:str|None=Field(default=None,min_length=1)
+    content:str|None=None
+    tool_name:Literal["workspace.write_text","workspace.read_text","sandbox.shell","mcp","send_email","answer_only"]|None=None
     command:list[str]=Field(default_factory=list)
     read_after_write:bool=Field(default=False)
     run_after_write:bool=Field(default=False,description="B5: run run_command after the write step")
@@ -291,7 +298,10 @@ class ScheduleCreate(BaseModel):
     goal: str = Field(min_length=1)
     target_path: str = "workspace"
     content: str = ""
-    tool_name: str = "workspace.write_text"
+    #: FP-L05b: omitted means "resolve from the goal" (free text). The old
+    #: ``workspace.write_text`` default turned a scheduled shell goal into a
+    #: write of its own request text.
+    tool_name: str | None = None
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
 
 

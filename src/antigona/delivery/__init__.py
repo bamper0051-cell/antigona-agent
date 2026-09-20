@@ -11,6 +11,14 @@ from .errors import (
     sanitize_delivery_error,
 )
 from .factory import get_adapter, register_adapter
+from .readback import (
+    READ_BACK_REFUTED,
+    READ_BACK_SEND_ACK,
+    READ_BACK_STATUSES,
+    READ_BACK_UNSUPPORTED,
+    DeliveryOutcome,
+    read_back_confirms_transmission,
+)
 from .router import Router
 from .worker import DeliveryWorker
 
@@ -34,4 +42,10 @@ __all__ = [
     "register_adapter",
     "Router",
     "DeliveryWorker",
+    "DeliveryOutcome",
+    "READ_BACK_SEND_ACK",
+    "READ_BACK_UNSUPPORTED",
+    "READ_BACK_REFUTED",
+    "READ_BACK_STATUSES",
+    "read_back_confirms_transmission",
 ]

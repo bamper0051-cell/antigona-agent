@@ -16,7 +16,7 @@ import re
 from enum import StrEnum
 from pathlib import Path
 
-from antigona.core.paths import home_dir
+from antigona.core.paths import home_dir, security_anchor_roots
 
 
 class RiskLevel(StrEnum):
@@ -37,7 +37,7 @@ class RiskLevel(StrEnum):
 # Первый элемент — домашний каталог, выводится из единственного резолвера
 # ``antigona.core.paths.home_dir()`` (уважает ANTIGONA_HOME_DIR), а не
 # хардкодится: иначе классификатор не считает реальный home высокорисковым,
-# когда HOME/ANTIGONA_HOME_DIR != /root (единый источник истины, ADR-007).
+# когда HOME/ANTIGONA_HOME_DIR != <host-root> (единый источник истины, ADR-007).
 HIGH_RISK_PATHS: list[str] = [
     str(home_dir()),
     "/etc",
@@ -499,6 +499,30 @@ def _normalize_path(path: str) -> str:
         return path
 
 
+def high_risk_zones() -> tuple[str, ...]:
+    """Every HIGH-risk path prefix the classifier honours.
+
+    Two sources, both fail-closed:
+
+    * ``HIGH_RISK_PATHS`` — the static system roots plus the ambient *home*
+      element.  The home element can only ever ADD a zone for the process's own
+      home; it must never be the ONLY reason a deployment is protected.
+    * the canonical, ambient-HOME-independent anchors from
+      ``antigona.core.paths.security_anchor_roots()`` — the deployment anchor
+      (the directory that owns the installed code root), the code root itself,
+      an explicitly configured ``ANTIGONA_HOME_DIR`` and the configured runtime
+      state root.  These are what keep ``<host-root>/**`` HIGH when the live unit runs
+      with ``HOME=/var/lib/antigona`` (defect A-CORE-001: the zone used to
+      depend on the process's ambient HOME, so the same absolute write was HIGH
+      under one unit and MEDIUM — i.e. grant-gated instead of refused — under
+      another).
+    """
+    zones: list[str] = list(HIGH_RISK_PATHS)
+    for anchor in security_anchor_roots():
+        zones.append(str(anchor))
+    return tuple(dict.fromkeys(zones))
+
+
 def is_high_risk_path(path: str, workspace_root: str | Path | None = None) -> bool:
     """Проверить, является ли путь системным/критичным или чувствительным."""
     if not path or not path.strip():
@@ -522,7 +546,7 @@ def is_high_risk_path(path: str, workspace_root: str | Path | None = None) -> bo
         return True
 
     norm = _normalize_path(path)
-    for high_path in HIGH_RISK_PATHS:
+    for high_path in high_risk_zones():
         if path.casefold().startswith(high_path.casefold()) or norm.casefold().startswith(high_path.casefold()):
             return True
 
@@ -539,7 +563,7 @@ def is_high_risk_path(path: str, workspace_root: str | Path | None = None) -> bo
 
     resolved_str = str(resolved)
     resolved_cf = resolved_str.casefold()
-    for high_path in HIGH_RISK_PATHS:
+    for high_path in high_risk_zones():
         hp = high_path.casefold()
         if resolved_cf == hp or resolved_cf.startswith(hp + "/") or resolved_cf.startswith(hp + "\\") or resolved_cf.startswith(hp):
             return True

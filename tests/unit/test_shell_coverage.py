@@ -133,7 +133,13 @@ def test_no_existing_container_runs_new_one(tmp_path: Path, monkeypatch: pytest.
     tool = DockerShellTool(tmp_path, timeout_seconds=5)
     result = tool.execute(ShellInput(("pip", "install", "edge-tts"), "exec-nofix"))
     assert result.ok, f"expected fall-through to new container, got: {result.error!r}"
-    assert result.data["output"] == "edge-tts installed"
+    # FP-L23R: the shell tool now keeps the container's stdout line structure —
+    # the trailing newline the container actually wrote is part of the effect
+    # trace (the durable artifact and the verifier's effect facts are built from
+    # this value). Flattening it here was the root cause of the glued live
+    # artifact; the chat-facing projection (result_safety.project_tool_result)
+    # still collapses newlines where a single line is needed.
+    assert result.data["output"] == "edge-tts installed\n"
     # recovery was attempted (inspect), then a real run was dispatched via Popen
     assert run_calls and run_calls[0][:2] == ["docker", "inspect"]
     assert tool._container_name is None  # reset in finally

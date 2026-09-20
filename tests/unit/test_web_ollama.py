@@ -66,12 +66,23 @@ async def test_ollama_status(monkeypatch, registry):
 
 
 @pytest.mark.asyncio
-async def test_ollama_switch(monkeypatch, registry):
+async def test_ollama_switch(monkeypatch, registry, tmp_path):
     monkeypatch.setattr(
         "antigona.tools.provider_switcher.switch_to_provider",
         lambda name: (True, f"Switched to {name}"),
     )
-    res = json.loads(await registry.dispatch("ollama", action="switch"))
+    # F-20260918T2000Z: ``switch`` mutates the active LLM provider and is now a
+    # gated, owner-approved action, so the dispatch must carry a valid one-shot
+    # grant.  The ungated read-only actions (``status``/``list``) are unchanged.
+    from antigona.security.approval_grant import ApprovalGrantStore
+
+    registry.grant_store = ApprovalGrantStore(tmp_path / "grants.sqlite")
+    token = registry.grant_store.issue(
+        actor="owner", tool_name="ollama", args={"action": "switch"}, issuer="test"
+    )
+    res = json.loads(
+        await registry.dispatch("ollama", action="switch", approval_token=token)
+    )
     assert res["success"] is True
 
 

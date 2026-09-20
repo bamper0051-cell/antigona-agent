@@ -47,6 +47,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SYSTEMD = Path("/var/lib/antigona-deployment/systemd")
 
 
+@pytest.fixture(autouse=True)
+def _workspace_env_matches_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mirror production wiring: the workspace root IS ``ANTIGONA_WORKSPACE``.
+
+    ``paths.workspace_dir()`` — the root the PolicyEngine fences against — reads that
+    variable, while this module builds ``Settings(workspace=tmp_path / "workspace")``.
+    Without the variable the two roots diverge, so an in-workspace write is classified
+    as an out-of-workspace mutation that correctly demands an owner grant.  The service
+    units export the variable; the test must too, or it stops modelling production.
+    """
+    monkeypatch.setenv("ANTIGONA_WORKSPACE", str(tmp_path / "workspace"))
+
+
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         database_url="sqlite:///:memory:",
@@ -109,8 +122,12 @@ def test_write_file_without_token_still_denied(
     target = tmp_path / "denied.txt"
     out = asyncio.run(_registry().dispatch("write_file", path=str(target), content="x"))
     parsed = json.loads(out)
-    assert "denied" in str(parsed.get("error", "")).lower(), out
-    assert "no fencing token" in str(parsed.get("error", ""))
+    # Fail-closed refusal is what this regression pins.  An out-of-workspace write is also a
+    # mutation the policy flags ``requires_approval`` (P1-002 parity with KernelExecutor), so
+    # the approval gate may answer before the ownership fence; either refusal is valid.
+    reason = str(parsed.get("error", ""))
+    assert parsed.get("success") is not True, out
+    assert "denied" in reason.lower() or parsed.get("requires_approval") is True, out
     assert not target.exists()  # INV-04: no side effect
 
 

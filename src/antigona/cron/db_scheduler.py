@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from antigona.models import CronSchedule, ScheduleEvent, TaskFlow, utcnow
 from antigona.queue import DurableQueue
 from antigona.repository import CreateTask, TaskRepository
+from antigona.task_goal import resolve_free_text_request
 
 
 class CronScheduleNotFound(Exception):
@@ -51,13 +52,37 @@ class CronScheduler:
         goal: str,
         target_path: str = "workspace",
         content: str = "",
-        tool_name: str = "workspace.write_text",
+        tool_name: str | None = None,
         tool_arguments: dict[str, Any] | None = None,
         schedule_id: str | None = None,
         correlation_id: str = "",
     ) -> CronSchedule:
+        """Create a durable cron schedule.
+
+        FP-L05b: when ``tool_name`` is omitted the goal is FREE TEXT and the
+        contract (tool, target, command, content) is resolved by the canonical
+        goal resolver — the same one ``POST /tasks`` and the planner use. The
+        old ``workspace.write_text`` default made a scheduled shell goal
+        ("запусти в оболочке ls") execute as a write of its own request text,
+        which the verifier then refuses.
+        """
         if not croniter.is_valid(cron_expression):
             raise ValueError(f"Invalid cron expression: {cron_expression}")
+        if tool_name is None:
+            request = resolve_free_text_request(goal)
+            tool_name = request.tool_name
+            # Only an ACTION plan with its own target moves the schedule's
+            # target: an effect-free goal keeps the caller's/default path, so a
+            # schedule that names no tool never acquires a surprising target.
+            if target_path == "workspace" and not request.answer_only and request.path:
+                target_path = request.path
+            if not content:
+                content = request.content or ""
+            if request.command:
+                tool_arguments = {
+                    **(tool_arguments or {}),
+                    "command": list(request.command),
+                }
         now = utcnow()
         itr = croniter(cron_expression, now)
         next_dt: datetime = itr.get_next(datetime)
@@ -134,16 +159,36 @@ class CronScheduler:
         for sched in due_schedules:
             if sched.cancelled or not sched.enabled:
                 continue
+            # FP-L05d: a schedule stored with the removed write default
+            # (``workspace.write_text`` + an empty body) must not be replayed as
+            # a write of its own request text. Resolve the goal on tick — same
+            # canonical resolver ``create_schedule`` and ``POST /tasks`` use.
+            tick_tool = sched.tool_name or ""
+            tick_path = sched.target_path
+            tick_content = sched.content
+            tick_command: tuple[str, ...] = ()
+            tick_params: dict[str, Any] = dict(sched.tool_arguments or {})
+            if tick_tool == "workspace.write_text" and not (tick_content or "").strip():
+                request = resolve_free_text_request(sched.goal)
+                tick_tool = request.tool_name
+                tick_content = request.content or ""
+                tick_command = request.command
+                if request.path:
+                    tick_path = request.path
+                if request.answer_only:
+                    tick_params = {**tick_params, "answer_only": True}
             idem_key = f"cron:{sched.id}:{sched.next_run_at.isoformat()}"
             try:
                 task, created = repo.create(
                     CreateTask(
                         owner_id=sched.owner_id,
                         goal=sched.goal,
-                        path=sched.target_path,
-                        content=sched.content,
+                        path=tick_path,
+                        content=tick_content,
                         idempotency_key=idem_key,
-                        tool_name=sched.tool_name,
+                        tool_name=tick_tool,
+                        command=tick_command,
+                        params=tick_params,
                     )
                 )
                 if created:

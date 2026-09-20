@@ -12,8 +12,9 @@
 2. черновик валиден → ``task.content`` == черновик;
 3. черновик ``None`` при ОТВЕТИВШЕМ провайдере (пустой вывод) → задача НЕ
    создаётся, clarification;
-4. черновик ``None`` без провайдера (degraded/offline) → задача создаётся с
-   ``content == message`` (прежнее поведение сохранено);
+4. черновик ``None`` без провайдера (degraded/offline) → тело РЕЗОЛВИТСЯ из
+   запроса; если тело из запроса не выводится — задача уходит в ``answer_only``
+   (fail-closed) и текст запроса в файл НЕ попадает (FP-L05d);
 5. путь записи не изменён: ``workspace.write_text`` пишет ровно ``task.content``.
 """
 
@@ -240,8 +241,17 @@ async def test_none_draft_without_provider_preserves_fallback() -> None:
     assert backend.submits[0]["content"] is None
 
 
-def test_task_service_degraded_fallback_uses_message(tmp_path: Path) -> None:
-    """task_service: content=None → в БД попадает текст запроса (degraded)."""
+def test_task_service_degraded_content_never_stores_request_text(tmp_path: Path) -> None:
+    """task_service: ``content=None`` → тело РЕЗОЛВИТСЯ, а не берётся из message.
+
+    FP-L05d: прежний degraded-контракт («content == message») и был живым
+    дефектом 4857f8d1 — в файл попадала инструкция владельца. Теперь:
+
+    * тело, которое ЕСТЬ в запросе, используется (никакого отказа ради отказа);
+    * тело, которое извлечь нельзя, не выдумывается: задача создаётся
+      ``answer_only`` с пустым телом (fail-closed, файл не создаётся);
+    * явный черновик по-прежнему выигрывает у всего остального.
+    """
     from antigona.core.task_service import TaskSubmissionService
     from antigona.database import Database
     from antigona.repository import TaskRepository
@@ -249,6 +259,8 @@ def test_task_service_degraded_fallback_uses_message(tmp_path: Path) -> None:
     database = Database(f"sqlite:///{tmp_path / 'svc.db'}")
     database.create_all()
     service = TaskSubmissionService(database)
+
+    # (1) тело запроса невыводимо → answer_only, текст запроса НЕ становится телом
     result = service.submit(
         owner_id="owner",
         message=_REQUEST,
@@ -258,9 +270,27 @@ def test_task_service_degraded_fallback_uses_message(tmp_path: Path) -> None:
     )
     with database.session_factory() as session:
         task = TaskRepository(session).get(result["id"])
-        assert task.content == _REQUEST
+        assert task.content != _REQUEST, (
+            "degraded-режим записал инструкцию владельца в файл"
+        )
+        assert not task.content.strip()
+        assert task.tool_arguments.get("answer_only") is True
 
-    # Явный черновик по-прежнему выигрывает у сообщения.
+    # (2) тело, названное в самом запросе, используется как тело
+    resolvable = "Создай notes.txt с текстом HELLO"
+    result_resolved = service.submit(
+        owner_id="owner",
+        message=resolvable,
+        path="notes.txt",
+        content=None,
+        idempotency_key="idem-degraded-resolvable",
+    )
+    with database.session_factory() as session:
+        resolved_task = TaskRepository(session).get(result_resolved["id"])
+        assert resolved_task.content == "HELLO"
+        assert resolved_task.tool_arguments.get("answer_only") is not True
+
+    # (3) Явный черновик по-прежнему выигрывает у сообщения.
     result2 = service.submit(
         owner_id="owner",
         message=_REQUEST,

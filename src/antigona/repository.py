@@ -13,14 +13,15 @@ from sqlalchemy.orm import Session, selectinload
 
 from .durable.state_cache import StateCache
 from .durable.state_machine import (
-    TERMINAL_STATES as TERMINAL,
-)
-from .durable.state_machine import (
+    OBSERVATION_ENTITY_TYPE,
     ConcurrentUpdate,
     InvalidTransition,
     check_step_transition,
     check_task_transition,
     record_rejection,
+)
+from .durable.state_machine import (
+    TERMINAL_STATES as TERMINAL,
 )
 from .models import (
     Approval,
@@ -33,6 +34,11 @@ from .models import (
     utcnow,
 )
 from .result_safety import is_sensitive_command, is_sensitive_path, sanitize_result_text
+from .security.approval_attribution import (
+    assert_attributed,
+    auto_approval_authority,
+    auto_approval_subject,
+)
 
 #: An owner approval stays usable for one hour — long enough for the flow to be
 #: picked up by a worker, short enough that a stale decision cannot authorize an
@@ -424,6 +430,17 @@ class TaskRepository:
         if self.state_cache is not None:
             self.state_cache.stage(self.session, task.id, target.value)
 
+    def _observe(self, task_id: str, entity_id: str, state: str, reason: str, actor: str, correlation_id: str | None = None) -> None:
+        """Journal a non-transition OBSERVATION (FP-L02).
+
+        Some knowledge is real but is not a state change: the owner steered the
+        flow, an expired lease was reclaimed. It must stay readable in the
+        append-only journal, so it is stored with ``entity_type ==
+        "observation"`` — never as a fabricated ``X -> X`` transition that would
+        pollute the audit and the self-transition metric.
+        """
+        self._journal(task_id, entity_id, OBSERVATION_ENTITY_TYPE, state, state, reason, actor, correlation_id)
+
     def transition_step(self, task: TaskFlow, step: FlowStep, target: StepState, reason: str, actor: str, correlation_id: str | None = None) -> None:
         current=StepState(step.status)
         try:
@@ -432,10 +449,19 @@ class TaskRepository:
             record_rejection(self.session, task_id=task.id, entity_id=step.id, entity_type="step", from_state=current.value, to_state=target.value, reason=reason, actor=actor, correlation_id=correlation_id)
             raise
         expected = step.revision if step.revision is not None else 0
+        # FP-L02: read the source state BEFORE the ORM-enabled UPDATE. An
+        # ORM-enabled ``update()`` synchronizes the identity map in place, so
+        # reading ``step.status`` afterwards returned the TARGET value: every
+        # step row was journalled as a fabricated ``RUNNING -> RUNNING`` /
+        # ``COMPLETED -> COMPLETED`` self-transition while the real edge
+        # (``PENDING -> RUNNING``, ``RUNNING -> COMPLETED``) was silently lost
+        # (152/152 live step rows were self-loops). ``old`` must be captured
+        # first.
+        old=step.status
         result=self.session.execute(update(FlowStep).where(FlowStep.id==step.id,FlowStep.revision==expected).values(status=target.value,revision=expected+1))
         assert isinstance(result,CursorResult)
         if result.rowcount != 1: raise ConcurrentUpdate("step revision CAS failed")
-        old=step.status; step.status=target.value; step.revision=expected+1
+        step.status=target.value; step.revision=expected+1
         self._journal(task.id, step.id, "step", old, target.value, reason, actor, correlation_id); self.session.flush()
 
     def acquire_lease(self, task: TaskFlow, worker: str, seconds: int) -> None:
@@ -491,7 +517,8 @@ class TaskRepository:
             if _rank.get(_step_risk, 1) > _rank.get(risk_level, 1):
                 risk_level = _step_risk
         policy = get_confirmation_policy()
-        decision = "APPROVED" if policy.should_auto_approve(risk_level) else "PENDING"
+        auto_approved = policy.should_auto_approve(risk_level)
+        decision = "APPROVED" if auto_approved else "PENDING"
         approval=Approval(
             task_id=task.id,
             tool_name=task.tool_name,
@@ -503,6 +530,22 @@ class TaskRepository:
             reason=f"{risk_level.value.lower()} risk tool requires confirmation",
             decision=decision,
         )
+        if auto_approved:
+            # FP-L09: a policy auto-approval is a DECISION and must name its
+            # subject. Without this the row is an anonymous "APPROVED" that no
+            # audit can tell apart from a forged owner approval. The subject is
+            # the deciding policy + accepted risk; decided_at records when.
+            # ``grant_token`` deliberately stays NULL — an auto approval is NOT
+            # an owner one-shot grant (gate/execution contract unchanged).
+            approval.decided_by = auto_approval_subject(risk_level)
+            approval.decided_at = utcnow()
+            approval.reason = (
+                f"{risk_level.value.lower()} risk tool requires confirmation "
+                f"(auto-approved by {auto_approval_authority(policy)})"
+            )
+        # FP-L09 invariant, enforced fail-closed at the write path: an APPROVED
+        # row is never persisted without a subject.
+        assert_attributed(approval.decision, approval.decided_by, approval_id=str(approval.id))
         self.session.add(approval); task.approvals.append(approval); self.session.flush(); return approval
 
     def decide_approval(self, task: TaskFlow, approval_id: str, owner: str, approve: bool) -> Approval:
@@ -515,7 +558,7 @@ class TaskRepository:
             # executing path. Minting failure => nothing is decided, the
             # approval stays PENDING (fail-closed), never a bare "APPROVED".
             approval.grant_token = self._mint_approval_grant(task, approval, owner)
-        approval.decision="APPROVED" if approve else "DENIED"; approval.decided_by=owner; approval.decided_at=utcnow(); self.session.commit(); return approval
+        approval.decision="APPROVED" if approve else "DENIED"; approval.decided_by=owner; approval.decided_at=utcnow(); assert_attributed(approval.decision, approval.decided_by, approval_id=str(approval.id)); self.session.commit(); return approval
 
     @staticmethod
     def _mint_approval_grant(task: TaskFlow, approval: Approval, owner: str) -> str:
@@ -554,7 +597,13 @@ class TaskRepository:
         tool_args["steer_messages"] = steer_list
         task.tool_arguments = tool_args
         task.updated_at = utcnow()
-        self._journal(task.id, task.id, "task", task.status, task.status, f"steer: {message}", actor, correlation_id)
+        # FP-L02: steering changes no flow state, so it is journalled as an
+        # OBSERVATION. The message stays fully readable in the append-only
+        # journal (and in replay / the WS event stream), but it no longer
+        # masquerades as a ``RUNNING -> RUNNING`` transition — which could also
+        # be picked up as a false terminal reason by the gateway result
+        # projector, since it matched on ``to_state == task.status``.
+        self._observe(task.id, task.id, task.status, f"steer: {message}", actor, correlation_id)
         self.session.commit()
         return self.get(task.id)
 

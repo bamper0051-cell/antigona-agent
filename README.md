@@ -199,6 +199,20 @@ bash install.sh
 не создаёт и не требует, `sudo` не использует, повторный запуск ничего не ломает.
 Пока проверка не прошла, скрипт не печатает «установлено».
 
+**Sandbox-образы (обязательное условие shell-команд).** Первая shell-команда
+запускается в контейнере из `python:3.12-slim` (worker) и `python:3.12-alpine`
+(файловый sandbox). Прокси сокета докера **по дизайну** запрещает pull
+(`POST /images/create` не в allowlist), поэтому образы надо пред-пуллить на хосте
+через **реальный** сокет, а не `/run/antigona/docker.sock`:
+
+```bash
+docker pull python:3.12-slim python:3.12-alpine
+```
+
+`install.sh` проверяет это best-effort на шаге провижининга и громко
+предупреждает, если образа нет; жёсткий отказ прямо на этапе установки
+включается переменной `ANTIGONA_REQUIRE_SANDBOX_IMAGE=1`.
+
 ### Проверка, что всё работает
 
 ```bash
@@ -242,6 +256,21 @@ target без `--force` (с `--force` — сначала бэкап в `--backup
 Установка drop-in, а равно
 `daemon-reload`/restart для его активации — **ручной шаг, одобряемый владельцем**;
 installer сам этого не делает.
+
+**Обязательное условие запуска (измерено).** Шиппинговый drop-in
+[`deploy/systemd/dropins/10-antigona-startup-gate.conf`](deploy/systemd/dropins/10-antigona-startup-gate.conf)
+добавляет в каждый юнит `ExecStartPre=<root>/scripts/startup_gate.sh`. Этот гейт
+запускает `python3 -m antigona.startup.validator --check=manifest`, который берёт
+deployment-envelope из переменной окружения `ANTIGONA_DEPLOYMENT_MANIFEST` либо, по
+умолчанию, из `<code-root>/CANDIDATE_DEPLOYMENT_MANIFEST.json`
+(см. `src/antigona/startup/validator.py:181`). Сам envelope **не входит** в публикуемое
+дерево — его поставляет оператор. Поэтому на чистом source-checkout / публичном клоне
+без envelope гейт завершается с `rc=1` и строкой
+`CRITICAL: startup gate FAIL-CLOSED - immutability validation (--check=manifest)`,
+а systemd **отменяет** запуск юнита (измерено: `bash scripts/startup_gate.sh` → rc=1).
+Единственный документированный обход — `ANTIGONA_SKIP_STARTUP_GATE=1` (громкий, виден
+в journal), либо предоставить envelope и указать на него `ANTIGONA_DEPLOYMENT_MANIFEST`.
+Подробнее — ADR-003, раздел «Operational prerequisite».
 
 ---
 

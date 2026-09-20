@@ -519,7 +519,42 @@ class ActionExecutor:
             )
             return res
 
-        path = Path(action.path)
+        # A-CORE-001/A-00: this executor parses LLM output, so it is a model
+        # write surface.  The single writable root is the canonical workspace;
+        # an ABSOLUTE target outside it (or a relative target that escapes it)
+        # is refused with no side effect.  This surface has no approval-grant
+        # plumbing, so it cannot honour a grant — fail closed instead of writing
+        # "as-is" (the owner-session risk gate below only covers HIGH, and an
+        # out-of-workspace target used to classify MEDIUM).
+        from antigona.security.risk_classifier import resolve_confined_workspace_path
+
+        confined = resolve_confined_workspace_path(action.path)
+        if confined is None:
+            res = ActionResult(
+                success=False,
+                action_type=ActionType.WRITE_FILE,
+                message=(
+                    "🚫 Запись вне workspace отклонена: требуется одобрение владельца "
+                    f"({action.path})."
+                ),
+                path=action.path,
+                error="APPROVAL_REQUIRED_OUT_OF_WORKSPACE",
+            )
+            self.audit_logger.log_action(
+                channel=channel,
+                user_id=user_id,
+                session_id=session_id,
+                command=f"WRITE_FILE {action.path}",
+                exit_code=403,
+                status="DENIED",
+                details={"reason": "OUT_OF_WORKSPACE_WRITE_REQUIRES_APPROVAL"},
+            )
+            return res
+
+        # Single writable root: the canonical workspace, for relative and
+        # absolute notation alike (a bare relative path used to be written
+        # relative to the process CWD, i.e. into the code tree).
+        path = confined
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             path.write_text(action.content, encoding="utf-8")

@@ -7,13 +7,16 @@
 #    2) создаёт виртуальное окружение в .venv/ (внутри клона);
 #    3) ставит зависимости из pyproject.toml (editable-установка пакета);
 #    4) ПРОВЕРЯЕТ установку реальным импортом и запуском CLI;
-#    5) печатает, что делать дальше.
+#    5) ПРОВИЖИНИТ sandbox-образы (python:3.12-slim / python:3.12-alpine):
+#       если их нет — ГРОМКО предупреждает с точной командой `docker pull ...`
+#       (best-effort по умолчанию; жёсткий отказ — ANTIGONA_REQUIRE_SANDBOX_IMAGE=1);
+#    6) печатает, что делать дальше.
 #
 #  Чего скрипт НЕ делает (сознательно):
 #    * не использует sudo и не пишет ничего вне каталога клона;
 #    * не делает глобальных pip install;
 #    * не создаёт, не запрашивает и не выдумывает секреты;
-#    * не требует платных сервисов и не обращается никуда, кроме PyPI;
+#    * не требует платных сервисов (pull идёт в реальный docker-сокет, не в прокси);
 #    * НЕ печатает «установлено успешно», пока это не подтверждено проверкой.
 #
 #  Использование:
@@ -27,6 +30,7 @@
 #    ANTIGONA_VENV=/path/to/venv     # куда ставить окружение (по умолчанию <клон>/.venv)
 #    ANTIGONA_PYTHON=/path/to/python # какой интерпретатор использовать
 #    ANTIGONA_INSTALL_EXTRAS=dev,tui # extras (аналог --extras)
+#    ANTIGONA_REQUIRE_SANDBOX_IMAGE=1 # без sandbox-образа — отказать (по умолчанию 0)
 # =============================================================================
 set -euo pipefail
 
@@ -51,7 +55,7 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 fail() { printf '\n\033[31m✗ УСТАНОВКА НЕ ЗАВЕРШЕНА:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -219,6 +223,22 @@ ok "antigona --help → OK ($(printf '%s\n' "$CLI_HELP_OUT" | wc -l) строк 
 
 # stamp пишем только после успешной проверки
 printf '%s\n' "$STAMP_VALUE" > "$STAMP_FILE" 2>/dev/null || warn "не удалось записать stamp (не критично)"
+
+# --- 5. Провижининг sandbox-образов (best-effort; hard-fail при REQUIRE=1) ----
+
+step "Провижининг sandbox-образов (python:3.12-slim / python:3.12-alpine)"
+
+PROVISION_SCRIPT="$ROOT/deploy/sandbox/provision_sandbox_images.sh"
+if [ -f "$PROVISION_SCRIPT" ]; then
+    if ! bash "$PROVISION_SCRIPT"; then
+        if [ "${ANTIGONA_REQUIRE_SANDBOX_IMAGE:-0}" = "1" ]; then
+            fail "sandbox-образы не провизионены, а ANTIGONA_REQUIRE_SANDBOX_IMAGE=1 — установка не завершена"
+        fi
+        warn "провижининг sandbox-образов не завершился — см. сообщения выше"
+    fi
+else
+    warn "не найден $PROVISION_SCRIPT — sandbox-образы не проверены"
+fi
 
 # --- Итог -------------------------------------------------------------------
 

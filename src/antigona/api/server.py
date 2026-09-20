@@ -5,11 +5,20 @@ LEGACY (v1.0.0): не используется активным кодом (Step
 Жив только для тестов (tests/integration/test_api_server_steer_idor.py).
 Канонический путь — antigona.gateway.api.
 
+Security (Stage 1 / AUDIT-C02): every non-liveness route is owner-scoped with
+``Depends(_require_owner)`` — ``GET /api/model/options`` (provider/model
+disclosure) and ``POST /v1/chat/completions`` (unauthenticated LLM proxy) are
+both gated; one MUST NOT be opened again on the "legacy, so anything goes"
+rationale.  The JSON-RPC ``execute_tool``/``chat`` methods require the same
+owner credential.  ``GET /health`` stays open on purpose (liveness probe).
+The HTTP server default bind is loopback (``127.0.0.1``); exposing it on all
+interfaces is an explicit opt-in via ``--host 0.0.0.0``.
+
 Provides:
 
-  - ``GET /health`` — liveness probe.
-  - ``GET /api/model/options`` — list available models / providers.
-  - ``POST /v1/chat/completions`` — OpenAI-compatible streaming endpoint.
+  - ``GET /health`` — liveness probe (intentionally unauthenticated).
+  - ``GET /api/model/options`` — list available models / providers (owner-scoped).
+  - ``POST /v1/chat/completions`` — OpenAI-compatible streaming endpoint (owner-scoped).
   - JSON-RPC through stdin (for Agent Communication Protocol (ACP)-style integration).
 """
 
@@ -48,20 +57,37 @@ def _require_owner(
     """Stage 1 security fix: every flow-mutating route in this legacy app must
     be owner-scoped, mirroring the canonical Gateway's Depends(owner). Without
     this, an unauthenticated caller could steer a foreign active flow."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "bearer token required")
+    owner_id = _owner_id_from_token(authorization[7:])
+    if owner_id is None:
+        raise HTTPException(401, "invalid bearer token")
+    return owner_id
+
+
+def _owner_id_from_token(raw_token: str) -> str | None:
+    """Resolve an owner id from a raw token, or ``None`` (fail-closed).
+
+    The single authority behind both the HTTP bearer dependency
+    (``_require_owner``) and the JSON-RPC owner credential: the same
+    ``Settings.from_env().dev_tokens`` set and the same constant-time
+    ``hmac.compare_digest`` over the SHA-256 digest.  An empty or unknown
+    token yields ``None`` so every caller fails closed.
+    """
     import hashlib
     import hmac
 
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "bearer token required")
+    if not raw_token:
+        return None
     from antigona.config import Settings
 
     settings = Settings.from_env()
-    digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
+    digest = hashlib.sha256(raw_token.encode()).hexdigest()
     for known, value in (settings.dev_tokens or {}).items():
         token_digest = hashlib.sha256(known.encode()).hexdigest()
         if hmac.compare_digest(digest, token_digest):
-            return value
-    raise HTTPException(401, "invalid bearer token")
+            return str(value)
+    return None
 
 
 
@@ -204,10 +230,15 @@ def create_app(
         return SteerFlowResponse(status="ok", flow_id=flow_id, message=request.message)
 
     @app.get("/api/model/options")
-    async def model_options() -> JSONResponse:
+    async def model_options(
+        owner_id: str = Depends(_require_owner),
+    ) -> JSONResponse:
         """List available models / providers.
 
-        Scans the provider directory and returns a list of options.
+        Owner-scoped (Stage 1 security fix, AUDIT-C02/S3): the provider/model
+        inventory is owner-only information disclosure, so it is gated by the
+        same owner credential as the mutating routes.  Scans the provider
+        directory and returns a list of options.
         """
         models: list[dict[str, Any]] = []
         try:
@@ -233,8 +264,15 @@ def create_app(
         return JSONResponse({"object": "list", "data": models})
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request) -> StreamingResponse:
+    async def chat_completions(
+        request: Request,
+        owner_id: str = Depends(_require_owner),
+    ) -> StreamingResponse:
         """OpenAI-compatible streaming chat completions endpoint.
+
+        Owner-scoped (Stage 1 security fix, AUDIT-C02/S1): this endpoint spends
+        the owner's provider keys and quota, so an unauthenticated caller must
+        not reach it.  The request is answered for the authenticated owner only.
 
         Request body (JSON)::
 
@@ -324,15 +362,41 @@ async def _handle_rpc_request(
 
     Built-in methods:
 
-      - ``ping`` — returns ``"pong"``.
-      - ``chat`` — send a message to the conversation engine.
-      - ``execute_tool`` — run a tool by name via the registry.
-      - ``list_tools`` — list registered tools.
-      - ``health`` — health check.
+      - ``ping`` — returns ``"pong"`` (unauthenticated read-only).
+      - ``chat`` — send a message to the conversation engine (owner credential
+        required: spends provider keys).
+      - ``execute_tool`` — run a tool by name via the registry (owner credential
+        required: ``params.owner_token``; fails closed without it).
+      - ``list_tools`` — list registered tools (unauthenticated read-only).
+      - ``health`` — health check (unauthenticated read-only).
     """
     req_id = request.get("id")
     method = request.get("method", "")
     params = request.get("params", {})
+
+    # Stage 1 security fix (AUDIT-C02/S5): JSON-RPC methods that mutate state or
+    # run a registry tool are owner-scoped exactly like the HTTP routes.  Before
+    # this, ``execute_tool`` dispatched ANY registry tool with no credential at
+    # all (it inherits every registry gate, but nothing authenticated the
+    # caller).  The credential is validated by the same authority as
+    # ``_require_owner`` (env dev-token set + constant-time digest compare); a
+    # missing/invalid token is a JSON-RPC error object, never a bare exception.
+    # ``ping``/``health``/``list_tools`` stay read-only and unauthenticated.
+    if method in {"execute_tool", "chat"}:
+        rpc_params = params if isinstance(params, dict) else {}
+        rpc_token = str(rpc_params.get("owner_token") or rpc_params.get("token") or "")
+        if _owner_id_from_token(rpc_token) is None:
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32001,
+                    "message": (
+                        f"{method} requires a valid owner credential "
+                        "(params.owner_token)"
+                    ),
+                },
+                "id": req_id,
+            }
 
     try:
         if method == "ping":
@@ -349,10 +413,31 @@ async def _handle_rpc_request(
             result = json.loads(result_raw)
         elif method == "list_tools":
             tools = registry.list()
-            result = [
-                {"name": t.name, "toolset": t.toolset, "schema": t.schema}
-                for t in tools
-            ]
+            # ``registry.list()`` is heterogeneous: new-style descriptor tools
+            # expose ``.toolset``/``.schema`` directly, while ToolABC contract
+            # tools only expose ``.spec`` (``.spec.category`` / ``.spec
+            # .input_schema``).  Mirror registry.list()'s guarded dual-type
+            # pattern so a contract object can never raise AttributeError here
+            # and turn the whole listing into a -32603 error.
+            result = []
+            for t in tools:
+                spec = getattr(t, "spec", None)
+                toolset = getattr(t, "toolset", None)
+                if toolset is None and spec is not None:
+                    category = getattr(spec, "category", None)
+                    toolset = getattr(category, "value", None)
+                if not isinstance(toolset, str):
+                    toolset = "" if toolset is None else str(toolset)
+                schema = getattr(t, "schema", None)
+                if schema is None and spec is not None:
+                    schema = getattr(spec, "input_schema", None)
+                result.append(
+                    {
+                        "name": getattr(t, "name", None),
+                        "toolset": toolset,
+                        "schema": schema if isinstance(schema, dict) else {},
+                    }
+                )
         elif method == "health":
             result = {"status": "ok", "version": "1.0.0"}
         else:
@@ -441,7 +526,7 @@ async def run_rpc_stdin(
 
 
 def run_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 8765,
     engine: ConversationEngine | None = None,
     executor: ActionExecutor | None = None,
@@ -450,7 +535,8 @@ def run_server(
     """Run the FastAPI HTTP server.
 
     Args:
-        host: Bind address.
+        host: Bind address (default: 127.0.0.1 loopback; pass "0.0.0.0" to
+            expose the server on every interface explicitly).
         port: Bind port.
         engine: Optional *ConversationEngine*.
         executor: Optional *ActionExecutor*.
@@ -474,7 +560,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Antigona API Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1 loopback; pass 0.0.0.0 to expose on all interfaces)")
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
     parser.add_argument("--rpc-stdin", action="store_true", help="Run JSON-RPC over stdin instead of HTTP")
     args = parser.parse_args()

@@ -114,6 +114,18 @@ VERIFIER_ONLY_TRANSITIONS: frozenset[tuple[TaskState, TaskState]] = frozenset(
     {(TaskState.VERIFYING, TaskState.DONE)}
 )
 
+#: Journal ``entity_type`` for an OBSERVATION — knowledge about a flow that is
+#: real and must stay readable, but that changes NO state (FP-L02).
+#:
+#: The append-only ``state_transitions`` table is the only journal we have, so an
+#: observation is stored as a row typed ``observation`` instead of a fabricated
+#: ``X -> X`` "transition": ``from_state == to_state`` on such a row is a marker
+#: of "nothing transitioned", never an edge. Readers that walk real transitions
+#: (metrics, audit, anomaly checks) must filter by this type or match on
+#: ``entity_type in {"task", "step"}`` — a self-repeating row of any other type
+#: is a defect, not history.
+OBSERVATION_ENTITY_TYPE: str = "observation"
+
 #: Legal step transitions.
 STEP_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
     StepState.PENDING: frozenset({StepState.RUNNING, StepState.CANCELLED}),

@@ -264,6 +264,13 @@ class ToolRegistry:
         # it is stripped from clean params upstream).  Consumed here and forwarded
         # only to handlers that enforce the ownership write fence.
         _ownership = kwargs.pop("_ownership", None)
+        # A-CORE-001/A-00: the "absolute out-of-workspace write is owner-approved"
+        # proof is minted HERE, after a real grant is consumed — never accepted
+        # from the caller.  A model/param-supplied value (in either spelling) is
+        # discarded, otherwise the handler gate could be walked around by simply
+        # passing the flag.
+        kwargs.pop("owner_approval_grant", None)
+        kwargs.pop("_owner_approval_grant", None)
         kwargs.pop("_owner_id", None)
         kwargs.pop("owner_id", None)
         kwargs.pop("auth_context", None)
@@ -360,12 +367,105 @@ class ToolRegistry:
                 str(getattr(tool, "toolset", "") or "").lower() == "shell"
                 or name == "run_shell"
             )
+            # AUDIT-C12/D — structural blindness of the six contract tools: they
+            # are registered via ``register_contract`` and carry no ``toolset``
+            # attribute, so ``getattr(tool, "toolset", "")`` is always empty and a
+            # name-only shell check can never classify them.  Fall back to the
+            # contract spec's category (a ``ToolCategory`` StrEnum) so a contract
+            # tool routed through the shell executor is still visible to the gate.
+            _tool_toolset = str(getattr(tool, "toolset", "") or "")
+            if not _tool_toolset:
+                _spec = getattr(tool, "spec", None)
+                _spec_category = getattr(_spec, "category", None)
+                if _spec_category is not None:
+                    _tool_toolset = str(getattr(_spec_category, "value", _spec_category))
+            _shell_class = _shell_class or _tool_toolset.lower() == "shell"
+            # AUDIT-C12/B — code-execution surfaces.  A MEDIUM verdict that merely
+            # says ``requires_approval`` is not enough for a tool that spawns a
+            # host process or runs caller-supplied code: the shell class already
+            # proves the product wants an owner grant for process execution, and
+            # these tools execute processes just as much as ``run_shell`` does.
+            # MCP/ACP are execution surfaces only for their *mutating* actions:
+            # ``mcp add`` registers an arbitrary stdio command and ``mcp call``
+            # invokes it; ``acp add``/``remove`` register an external executor.
+            # Their read-only actions (``list``, ``tools``) stay ungated so
+            # ordinary discovery work is not turned into an approval prompt
+            # (the 17-tool wave-4a regression is forbidden).
+            # AUDIT-C13-WHITESPACE-BYPASS (P1, 2026-09-18): the gate used to classify
+            # the RAW action (``str(kwargs.get("action") or "").lower()``) while the
+            # handlers normalize with ``.strip().lower()``.  A caller could therefore
+            # send ``action="start "`` / ``" start"`` / ``"start\t"`` and the composite
+            # terms below never matched, so the spawn ran with no grant
+            # (driver-reproduced: ``subprocess.Popen(['ollama','serve'])``).  The
+            # classification must use the SAME normalization the handler uses,
+            # otherwise the gate and the executed action can disagree.
+            _composite_action = str(kwargs.get("action") or "").strip().lower()
+            _code_exec_class = (
+                _shell_class
+                or name in _CODE_EXECUTION_ACTIONS
+                or (name == "mcp" and _composite_action in {"add", "call"})
+                or (name == "acp" and _composite_action in {"add", "remove"})
+            )
+            # F-20260918T2000Z_OLLAMA_CODE_EXEC_UNGATED — the ``ollama`` tool spawns a
+            # host process (``subprocess.Popen(["ollama", "serve"])`` on ``start``), runs
+            # ``subprocess.run(["ollama", "pull", model])`` on ``pull`` and mutates the
+            # active LLM provider on ``switch``.  It is registered with
+            # ``toolset="llm"`` and is neither shell-class, code-exec-class nor a file
+            # write, so the gate above never classified it: a MEDIUM verdict that merely
+            # said ``requires_approval`` produced no grant and the spawn ran ungated.
+            # Force the owner grant for exactly these executing/mutating actions,
+            # independently of the policy's ``requires_approval`` flag (the defect was
+            # precisely that the flag is not authoritative for a toolset="llm" surface).
+            # The ``status``/``list`` actions are read-only discovery and stay UNGATED
+            # (wave-4a forbids turning ordinary read-only work into an approval prompt).
+            # ``policy_allowed`` keeps this from turning a non-approval denial (missing
+            # identity, INTERNAL_ERROR) into a grantable action.
+            _ollama_exec_action = (
+                policy_allowed
+                and name == "ollama"
+                and _composite_action in {"start", "pull", "switch"}
+            )
+            # P1-002 parity with the KernelExecutor gate (2026-09-18).  A *file-write* tool
+            # the policy already answers with ``requires_approval: true`` (MEDIUM/SENSITIVE,
+            # e.g. an absolute target outside the workspace) is a mutation, not a read:
+            # the narrow risk-only gate let that verdict through, so the model path could
+            # write an arbitrary absolute path with no grant (A-00, live-reproduced on M29).
+            # In-workspace writes stay auto-allowed (LOW/SAFE, requires_approval=false) and
+            # read-only tools stay untouched, so no ordinary tool is converted into an
+            # approval prompt.  The decision uses the policy verdict itself (the same
+            # authority the KernelExecutor path trusts) - no second workspace computation
+            # that could disagree with the configured workspace root.
+            _write_action = False
+            if name in _OWNERSHIP_AWARE_HANDLERS:
+                _write_action = True
+            else:
+                try:
+                    from antigona.security.risk_classifier import is_write_action
+
+                    _write_action = bool(is_write_action(name))
+                except Exception:  # noqa: BLE001 - fail-closed: an unclassified action
+                    # must not silently widen access.  Treat it as a potential write so
+                    # the approval gate below still applies (the mutation gate only
+                    # fires when the policy itself already demands approval, so this
+                    # cannot convert a read-only verdict into a prompt).
+                    _write_action = True
+            # P2 (FP-L04): the extra ``_risk not in {"", "LOW"}`` filter masked risk.
+            # Only an explicit LOW verdict is a safe (auto-approved) write; MEDIUM,
+            # HIGH, CRITICAL and a missing/unknown risk level all need the grant.
+            _mutation_needs_owner = bool(
+                policy_requires_approval and _write_action and _risk != "LOW"
+            )
             _needs_grant = bool(
                 policy_verdict.get("requires_2step_confirmation")
-            ) or (
-                policy_requires_approval and (_risk in {"HIGH", "CRITICAL"} or _shell_class)
+            ) or _ollama_exec_action or (
+                policy_requires_approval
+                and (_risk in {"HIGH", "CRITICAL"} or _code_exec_class or _mutation_needs_owner)
             )
-            if _needs_grant and name not in _OWNERSHIP_AWARE_HANDLERS:
+            # The ownership-fence handlers authorize themselves, but only for writes the
+            # policy does not already flag for owner approval: an approval-flagged mutation
+            # must not inherit that exemption.
+            _fence_exempt = name in _OWNERSHIP_AWARE_HANDLERS and not _mutation_needs_owner
+            if _needs_grant and not _fence_exempt:
                 grant_consumed, detail, grant_id = self._consume_approval_grant(
                     token=approval_token,
                     actor=user_id,
@@ -522,6 +622,13 @@ class ToolRegistry:
         # is never handed a new keyword.
         if _ownership is not None and name in _OWNERSHIP_AWARE_HANDLERS:
             kwargs["ownership"] = _ownership
+        # A-CORE-001/A-00: an absolute write outside the workspace is only
+        # written when THIS dispatch consumed a real one-shot owner grant.  The
+        # flag is minted here, after the gate above, and can never come from the
+        # model: underscore-prefixed params are stripped upstream and this kwarg
+        # is added only for the ownership-aware handler.
+        if name in _OWNERSHIP_AWARE_HANDLERS and grant_consumed:
+            kwargs["owner_approval_grant"] = True
         try:
             from antigona.tools.contracts import ToolInput
             if isinstance(tool, ToolABC):
@@ -644,8 +751,29 @@ class ToolRegistry:
 _OWNERSHIP_AWARE_HANDLERS = frozenset({"write_file"})
 
 
+#: Code-execution surfaces (AUDIT-C12): handlers that spawn a host process or run
+#: caller-supplied code.  A MEDIUM verdict with ``requires_approval`` is not enough
+#: for these — the shell class already proves the product wants an owner grant for
+#: process execution, and these execute processes just as much as ``run_shell``:
+#:   * ``run_shell``      — asyncio.create_subprocess_shell
+#:   * ``tmux``           — asyncio.create_subprocess_exec
+#:   * ``frontend_build`` — subprocess.run npm/npx/vite (npm run <script>)
+#:   * ``run_code``       — reserved by RiskClassifier._classify_run_code
+_CODE_EXECUTION_ACTIONS: frozenset[str] = frozenset({
+    "run_shell",
+    "tmux",
+    "frontend_build",
+    "run_code",
+})
+
+
 async def _handle_write_file(
-    *, path: str, content: str, ownership: OwnershipContext | None = None, **kwargs: Any
+    *,
+    path: str,
+    content: str,
+    ownership: OwnershipContext | None = None,
+    owner_approval_grant: bool = False,
+    **kwargs: Any,
 ) -> str:
     """WRITE_FILE handler.
 
@@ -653,9 +781,27 @@ async def _handle_write_file(
     the raw, possibly-relative input) so a later "where is the file" answer
     is grounded in the actual filesystem result, not the caller's guess.
 
-    Absolute paths are written as-is (owner-level / already-approved tool).
-    Relative paths resolve from the project root. Workspace-relative sandbox
-    checks belong on ``workspace.write_text``, not this handler.
+    There is exactly ONE writable root: the canonical workspace
+    (``paths.workspace_dir()`` / ``ANTIGONA_WORKSPACE``), shared with the policy
+    layer.  A relative path is resolved against it (FP-L04-relative); an
+    ABSOLUTE path outside it is written ONLY when the caller proves a real
+    owner approval was consumed (``owner_approval_grant``, set by
+    ``ToolRegistry.dispatch`` and never by a model — model params are stripped of
+    underscore keys upstream).  Without that proof the write is refused with no
+    side effect (A-CORE-001/A-00: "absolute paths are written as-is" let the
+    model path place a file anywhere on the host whenever the policy verdict was
+    ``allowed=True`` — which an elevated session produces even for an
+    out-of-workspace target).
+
+    FP-L04-relative: a *relative* path is resolved against the SAME canonical
+    workspace root the policy layer uses (``resolve_confined_workspace_path`` →
+    ``paths.workspace_dir()``).  Resolving against ``paths.project_root()`` made
+    the policy and the handler disagree: the policy classified
+    ``write_file path="evil.txt"`` as an in-workspace LOW write (relative to the
+    workspace) while the handler wrote it into the code tree, i.e. a code-tree
+    write with no approval.  The path must also stay inside the fence; an
+    escaping relative path is refused with no side effect (fail-closed) instead
+    of being silently widened to another root.
 
     DF-WO2-003-full: this is a live write surface, so it enforces the
     ownership fence BEFORE any filesystem mutation.  ``ownership`` is the
@@ -669,10 +815,42 @@ async def _handle_write_file(
             enforce_write_fence(ownership, "registry.write_file")
         except FenceDeniedError as exc:
             return json.dumps({"error": f"protected write denied: {exc.check.reason}"})
-        p = Path(path)
-        if not p.is_absolute():
-            p = paths.project_root() / p
-        p = p.resolve()
+        from antigona.security.risk_classifier import resolve_confined_workspace_path
+
+        raw_path = Path(path)
+        # Single root shared with the policy classifier.  ``None`` means "no
+        # canonical workspace" or "outside the fence" — both fail closed.
+        confined = resolve_confined_workspace_path(path)
+        if confined is not None:
+            p = confined
+        elif raw_path.is_absolute():
+            if not owner_approval_grant:
+                return json.dumps(
+                    {
+                        "error": (
+                            "absolute write outside the workspace requires owner "
+                            f"approval: {path}"
+                        ),
+                        "denied": True,
+                        "requires_approval": True,
+                        "path": path,
+                    }
+                )
+            p = raw_path.resolve()
+        else:
+            # Not a grantable requirement: no grant authorizes a relative
+            # target that leaves the fence, so the refusal says so instead of
+            # asking for an approval that could never work.
+            return json.dumps(
+                {
+                    "error": (
+                        "path boundary violation: relative write target "
+                        f"escapes the workspace fence: {path}"
+                    ),
+                    "denied": True,
+                    "path": path,
+                }
+            )
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return json.dumps({"success": True, "path": str(p), "bytes": p.stat().st_size})
