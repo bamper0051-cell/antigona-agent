@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -188,6 +188,28 @@ class DeliveryWorker:
             event_type=str(item.event_type or "result"),
         )
         channel_name = item.adapter or "progress"
+
+        # TelegramAdapter instances are recreated with each worker. Recover the
+        # persisted progress bubble before dispatching the next transition.
+        if event.event_type == "transition":
+            adapter = self.adapter
+            recover_progress_message = getattr(adapter, "recover_progress_message", None)
+            if callable(recover_progress_message):
+                prior_message_id = session.scalar(
+                    select(DeliveryReceipt.provider_message_id)
+                    .where(
+                        and_(
+                            DeliveryReceipt.task_id == item.task_id,
+                            DeliveryReceipt.adapter == channel_name,
+                            DeliveryReceipt.provider_message_id.is_not(None),
+                            DeliveryReceipt.transmitted.is_(True),
+                        )
+                    )
+                    .order_by(DeliveryReceipt.delivered_at.desc())
+                    .limit(1)
+                )
+                if prior_message_id is not None:
+                    recover_progress_message(item.task_id, prior_message_id)
 
         try:
             if self.router is not None:

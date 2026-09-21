@@ -6,7 +6,7 @@ Corresponds to docs/v3/03_REQUIRED_REGRESSION_TESTS.md specification.
 from __future__ import annotations
 
 import inspect
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from rich.cells import cell_len
@@ -14,7 +14,7 @@ from rich.cells import cell_len
 import antigona.cli_ui.layout as layout_module
 from antigona.cli_ui.layout import AntigonaLayout
 from antigona.cli_ui.models import ChatUIState
-from antigona.cli_ui.portrait import EyeSocket, PortraitEngine
+from antigona.cli_ui.portrait import PortraitEngine
 from antigona.cli_ui.portrait_engine import (
     PortraitController,
     PortraitState,
@@ -51,37 +51,40 @@ def _make_layout(status: str = "idle") -> AntigonaLayout:
 
 # ── Geometry ─────────────────────────────────────────────────────────────────
 
-def test_left_eye_anchor_inside_eye_socket() -> None:
+def test_face_map_has_no_eyes_or_eye_sockets() -> None:
     engine = PortraitEngine()
-    for _profile_name, sockets in engine.eye_sockets.items():
-        sock = sockets["left"]
-        assert isinstance(sock, EyeSocket)
-        assert sock.min_x <= sock.center_x <= sock.max_x
-        assert sock.min_x <= sock.clamp_x(sock.center_x - 5) <= sock.max_x
-        assert sock.min_x <= sock.clamp_x(sock.center_x + 5) <= sock.max_x
+    for profile_name, spec in engine.face_map.items():
+        assert "eyes" not in spec, f"{profile_name} has eyes in face_map.json"
+        assert "eye_sockets" not in spec, f"{profile_name} has eye_sockets in face_map.json"
+        assert "brows" in spec
+        assert "mouth" in spec
+        assert "tear" in spec
+        assert "face_protect" in spec
 
 
-def test_right_eye_anchor_inside_eye_socket() -> None:
+def test_brow_and_mouth_anchors_within_bounds() -> None:
     engine = PortraitEngine()
-    for _profile_name, sockets in engine.eye_sockets.items():
-        sock = sockets["right"]
-        assert isinstance(sock, EyeSocket)
-        assert sock.min_x <= sock.center_x <= sock.max_x
-        assert sock.min_x <= sock.clamp_x(sock.center_x - 5) <= sock.max_x
-        assert sock.min_x <= sock.clamp_x(sock.center_x + 5) <= sock.max_x
+    for _profile_name, spec in engine.face_map.items():
+        cols, rows = spec["cols"], spec["rows"]
+        (lx, by1), (rx, by2) = spec["brows"]
+        mx, my = spec["mouth"]
+        assert 0 <= lx < rx < cols
+        assert 0 <= by1 < my < rows
+        assert 0 <= by2 < my < rows
 
 
-def test_eye_never_enters_nose_region() -> None:
+def test_no_eye_glyphs_in_rendered_portrait_or_assets() -> None:
     engine = PortraitEngine()
-    for profile_name in engine.profiles:
-        sockets = engine.eye_sockets[profile_name]
-        l_sock = sockets["left"]
-        r_sock = sockets["right"]
-        # Left eye max_x must be strictly less than right eye min_x
-        assert l_sock.max_x < r_sock.min_x
+    eye_glyphs = set("●◒⌒◉◐◑◖◗○")
+    for profile_name, prof in engine.profiles.items():
         for gaze in ("far_left", "left", "center", "right", "far_right"):
-            lines = engine.render(profile_name, gaze=gaze)
-            assert len(lines) == engine.profiles[profile_name].rows
+            for exp in ("idle", "focus", "laugh", "cry", "error", "success"):
+                lines = engine.render(profile_name, gaze=gaze, expression=exp, phase=1)
+                assert len(lines) == prof.rows
+                for line in lines:
+                    assert len(line) == prof.cols
+                    for g in eye_glyphs:
+                        assert g not in line, f"Found {g} in {profile_name} frame"
 
 
 def test_portrait_dimensions_constant() -> None:
@@ -180,34 +183,31 @@ def test_blinking_is_removed_from_the_renderer() -> None:
     """Blinking was deleted outright: the engine exposes no `blink` parameter,
     ships no `blink` keyframe, and can reach no closed-eye frame."""
     engine = PortraitEngine()
-    sockets = engine.eye_sockets["medium"]
-    l_sock, r_sock = sockets["left"], sockets["right"]
 
     for profile_name, frames in engine.keyframes.items():
         assert "blink" not in frames, f"{profile_name} still ships a blink keyframe"
-
-    for gaze in ("far_left", "left", "center", "right", "far_right"):
-        for expression in ("idle", "focus", "laugh", "cry", "error", "success"):
-            lines = engine.render("medium", gaze=gaze, expression=expression, phase=3)
-            assert lines[l_sock.open_y][l_sock.center_x] != "─"
-            assert lines[r_sock.open_y][r_sock.center_x] != "─"
 
     with pytest.raises(TypeError):
         engine.render("medium", gaze="center", blink=True)  # type: ignore[call-arg]
 
 
-def test_thinking_eye_animation() -> None:
+def test_thinking_iridescent_palette_animation() -> None:
     layout = _make_layout(status="planning")
     assert layout._portrait_expression() == "focus"
-    color = layout._portrait_eye_color()
-    assert color.startswith("#")
+    with patch.object(layout_module, "_terminal_size", return_value=(80, 60)):
+        fragments = layout._get_portrait_fragments()
+        portrait_styles = [style for style, text in fragments if "SOUL:" not in text and "❖" not in text and "\n" in text and "GATEWAY" not in text and "STATUS" not in text and "╭" not in text and "╰" not in text]
+        for st in portrait_styles:
+            assert "fg:#" in st
 
 
-def test_working_eye_animation() -> None:
+def test_working_iridescent_palette_animation() -> None:
     layout = _make_layout(status="tool_executing")
     assert layout._portrait_expression() == "focus"
-    color = layout._portrait_eye_color()
-    assert color.startswith("#")
+    with patch.object(layout_module, "_terminal_size", return_value=(80, 60)):
+        fragments = layout._get_portrait_fragments()
+        styles = [style for style, _ in fragments]
+        assert any("bold" in s or "#A3FF12" in s for s in styles)
 
 
 def test_no_idle_busy_loop() -> None:
@@ -227,8 +227,9 @@ def test_previous_animation_cancelled_on_higher_priority_state() -> None:
 def test_waiting_approval_stops_working_motion() -> None:
     layout = _make_layout(status="waiting_approval")
     assert layout._portrait_expression() == "sad"
-    color = layout._portrait_eye_color()
-    assert color == ""
+    with patch.object(layout_module, "_terminal_size", return_value=(80, 60)):
+        fragments = layout._get_portrait_fragments()
+        assert len(fragments) > 0
 
 
 def test_success_returns_to_idle() -> None:

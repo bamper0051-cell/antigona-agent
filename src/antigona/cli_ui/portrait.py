@@ -37,41 +37,6 @@ GAZE_ORDER: Final[tuple[str, ...]] = (
     "right",
     "far_right",
 )
-GAZE_CHARS: Final[dict[str, str]] = {
-    "far_left": "◖",
-    "left": "◐",
-    "slight_left": "◐",
-    "center": "●",
-    "slight_right": "◑",
-    "right": "◑",
-    "far_right": "◗",
-}
-
-#: Eye glyphs used while the operator is composing a long input line — a
-#: deliberately tiny "concentrated" variant (two cells changed, never more).
-FOCUS_GAZE_CHARS: Final[dict[str, str]] = {
-    "far_left": "◐",
-    "left": "◓",
-    "slight_left": "◓",
-    "center": "◉",
-    "slight_right": "◓",
-    "right": "◓",
-    "far_right": "◑",
-}
-
-#: Horizontal eye-socket offset per bucket, in terminal cells.  The calibrated
-#: sockets are only ±1 cell wide (see ``face_map.json``), so the intermediate
-#: buckets share the centre column and are distinguished by their glyph — the
-#: bucket enum and the whole smoothing API stay seven-way regardless.
-GAZE_EYE_OFFSETS: Final[dict[str, int]] = {
-    "far_left": -1,
-    "left": 0,
-    "slight_left": 0,
-    "center": 0,
-    "slight_right": 0,
-    "right": 0,
-    "far_right": 1,
-}
 
 #: Normalised horizontal gaze coordinate per bucket, evenly spread over
 #: ``[-1.0, +1.0]``.  This is the continuous space the smoother eases through.
@@ -122,19 +87,6 @@ ACTIVE_STATUSES: Final[frozenset[str]] = frozenset(
 
 EngineName = Literal["hybrid", "v1", "v2"]
 ExpressionName = Literal["idle", "focus", "smile", "laugh", "sad", "cry", "error", "success"]
-
-
-@dataclass(frozen=True)
-class EyeSocket:
-    """Calibrated eye socket boundaries for socket-clamped eye overlays."""
-
-    center_x: int
-    open_y: int
-    min_x: int
-    max_x: int
-
-    def clamp_x(self, x: int) -> int:
-        return max(self.min_x, min(self.max_x, x))
 
 
 @dataclass(frozen=True)
@@ -247,7 +199,6 @@ class PortraitEngine:
         self.base: dict[str, tuple[str, ...]] = {}
         self.keyframes: dict[str, dict[str, tuple[str, ...]]] = {}
         self.profiles: dict[str, PortraitProfile] = {}
-        self.eye_sockets: dict[str, dict[str, EyeSocket]] = {}
 
         for name in _PROFILE_ORDER:
             spec = raw_map[name]
@@ -261,42 +212,6 @@ class PortraitEngine:
             for path in (asset_root / name / "keyframes").glob("*.txt"):
                 keyframes[path.stem] = _read_lines(path)
             self.keyframes[name] = keyframes
-
-            # Initialize calibrated eye sockets with fallback if needed
-            if "eye_sockets" in spec:
-                l_raw = spec["eye_sockets"]["left"]
-                r_raw = spec["eye_sockets"]["right"]
-                self.eye_sockets[name] = {
-                    "left": EyeSocket(
-                        center_x=int(l_raw["center_x"]),
-                        open_y=int(l_raw["open_y"]),
-                        min_x=int(l_raw["min_x"]),
-                        max_x=int(l_raw["max_x"]),
-                    ),
-                    "right": EyeSocket(
-                        center_x=int(r_raw["center_x"]),
-                        open_y=int(r_raw["open_y"]),
-                        min_x=int(r_raw["min_x"]),
-                        max_x=int(r_raw["max_x"]),
-                    ),
-                }
-            elif "eyes" in spec and len(spec["eyes"]) >= 2:
-                lx, ly = spec["eyes"][0]
-                rx, ry = spec["eyes"][1]
-                self.eye_sockets[name] = {
-                    "left": EyeSocket(
-                        center_x=int(lx),
-                        open_y=int(ly),
-                        min_x=int(lx) - 1,
-                        max_x=int(lx) + 1,
-                    ),
-                    "right": EyeSocket(
-                        center_x=int(rx),
-                        open_y=int(ry),
-                        min_x=int(rx) - 1,
-                        max_x=int(rx) + 1,
-                    ),
-                }
 
     def profile_for_terminal(self, cols: int, rows: int) -> PortraitProfile | None:
         """Return the largest profile that leaves usable chat history below it."""
@@ -370,14 +285,17 @@ class PortraitEngine:
     ) -> tuple[str, ...]:
         """Render one fixed-geometry portrait frame.
 
+        Note: `gaze` and `input_focus` are kept in the signature for API
+        compatibility with layout callers, but eye glyph mechanics have been
+        removed, so they no longer modify the facial eye sockets.
+
         ``bias`` biases the working glitch towards the half of the face the
-        operator was last looking at; ``input_focus`` swaps in the concentrated
-        eye glyphs; ``working_intensity`` (0..1) scales the glitch while a task
-        ramps up or fades out.
+        operator was last looking at; ``working_intensity`` (0..1) scales the
+        glitch while a task ramps up or fades out.
         """
         if profile_name not in self.profiles:
             raise KeyError(f"Unknown portrait profile: {profile_name}")
-        if gaze not in GAZE_CHARS:
+        if gaze not in GAZE_ORDER:
             gaze = "center"
         if engine not in {"hybrid", "v1", "v2"}:
             engine = "hybrid"
@@ -450,29 +368,6 @@ class PortraitEngine:
         input_focus: bool = False,
     ) -> list[str]:
         grid = [list(row) for row in self.base[profile_name]]
-        spec = self.face_map.get(profile_name, {})
-        sockets = self.eye_sockets.get(profile_name)
-
-        offset = GAZE_EYE_OFFSETS.get(gaze, 0)
-        chars = FOCUS_GAZE_CHARS if input_focus else GAZE_CHARS
-
-
-        if sockets:
-            l_sock = sockets["left"]
-            r_sock = sockets["right"]
-
-            target_lx = l_sock.clamp_x(l_sock.center_x + offset)
-            target_rx = r_sock.clamp_x(r_sock.center_x + offset)
-
-            eye_char = chars.get(gaze, "●")
-            self._set_char_safe(grid, target_lx, l_sock.open_y, eye_char)
-            self._set_char_safe(grid, target_rx, r_sock.open_y, eye_char)
-        elif "eyes" in spec and len(spec["eyes"]) >= 2:
-            (ex1, ey1), (ex2, ey2) = spec["eyes"][0], spec["eyes"][1]
-            eye_char = chars.get(gaze, "●")
-            self._set_char_safe(grid, int(ex1), int(ey1), eye_char)
-            self._set_char_safe(grid, int(ex2), int(ey2), eye_char)
-
         lines = ["".join(row) for row in grid]
         if expression == "cry":
             lines = self._overlay_tear(profile_name, lines, phase)
@@ -595,15 +490,11 @@ class PortraitEngine:
 __all__ = [
     "ACTIVE_STATUSES",
     "ASSET_ROOT",
-    "FOCUS_GAZE_CHARS",
-    "GAZE_CHARS",
     "GAZE_EASE_DURATION",
-    "GAZE_EYE_OFFSETS",
     "GAZE_ORDER",
     "GAZE_TO_BIAS",
     "GAZE_X",
     "GLITCH_BIAS_FACTORS",
-    "EyeSocket",
     "GazeSmoother",
     "PortraitEngine",
     "PortraitProfile",

@@ -509,11 +509,11 @@ def _effect_context(
     """The FP-L23 effect report for the judge: artifact identity + execution facts.
 
     The recorded stdout is reported only when the step really completed without
-    withholding its output (``_recorded_effect_facts``); a tool target path is
-    reported instead for tools whose effect is a file rather than stdout.
+    withholding its output (``_recorded_effect_facts``). Target paths remain
+    artifact identity, never synthetic stdout evidence.
     """
     facts = _recorded_effect_facts(task)
-    recorded = facts.get("stdout", "") or facts.get("target", "")
+    recorded = facts.get("stdout", "")
     return EffectContext(
         artifact_path=artifact_path,
         artifact_size=size,

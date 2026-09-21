@@ -163,6 +163,10 @@ class TelegramAdapter:
         #: task_id → text currently shown in that bubble (skips no-op edits).
         self._progress_texts: dict[str, str] = {}
 
+    def recover_progress_message(self, task_id: str, provider_message_id: str) -> None:
+        """Restore a durable progress bubble reference after adapter restart."""
+        self._progress_message_ids[task_id] = int(provider_message_id)
+
 
     def send_file(self, path: str, caption: str = "") -> dict[str, Any]:
         """Send a document/file to the configured chat via sendDocument (multipart)."""

@@ -190,67 +190,85 @@ def test_gaze_hysteresis_resets_on_empty_input() -> None:
     assert layout._portrait_gaze_committed == "center"
 
 
-def test_eye_glow_returns_color_during_thinking() -> None:
-    """Eye glow must return a non-empty color string for THINKING statuses."""
+def test_portrait_fragments_iridescent_palette_idle() -> None:
+    """Idle state uses iridescent ramp colors with diagonal drift."""
+    from antigona.cli_ui.layout import _IRIDESCENT_RAMP
     layout = _layout()
-    layout.state = layout.state.__class__(
-        messages=[],
-        current_status="planning",
-        events=[],
-        connection="connected",
-        gateway_url="http://127.0.0.1:8090",
-        session_id="test",
-    )
-    layout._portrait_phase = 2  # mid-cycle
-    color = layout._portrait_eye_color()
-    assert color.startswith("#"), f"Expected hex color, got: {color!r}"
-    assert len(color) == 7
+    with patch.object(layout_module, "_terminal_size", return_value=(80, 60)):
+        colors_seen: set[str] = set()
+        for p in (0, 4, 8, 12, 16, 20):
+            layout._portrait_phase = p
+            frags = layout._get_portrait_fragments()
+            for style, text in frags:
+                if "\n" in text and "❖" not in text and "GATEWAY" not in text and "STATUS" not in text and "╭" not in text and "╰" not in text:
+                    assert style.startswith("fg:#")
+                    color = style[3:]
+                    assert color in _IRIDESCENT_RAMP
+                    colors_seen.add(color)
+        assert len(colors_seen) >= 4, f"Expected >= 4 colors, got {len(colors_seen)}"
 
 
-def test_eye_glow_returns_empty_during_idle() -> None:
-    """Eye glow must return empty string during idle state (no pulsing)."""
+def test_portrait_fragments_iridescent_palette_active() -> None:
+    """Active state uses iridescent ramp + scanline beam."""
+    from antigona.cli_ui.layout import _IRIDESCENT_RAMP
     layout = _layout()
-    # idle state is the default
-    color = layout._portrait_eye_color()
-    assert color == "", f"Expected empty string during idle, got: {color!r}"
+    _with_status(layout, "tool_executing")
+    with patch.object(layout_module, "_terminal_size", return_value=(80, 60)):
+        layout._portrait_phase = 5
+        frags = layout._get_portrait_fragments()
+        has_beam = False
+        for style, text in frags:
+            if "\n" in text and "❖" not in text and "GATEWAY" not in text and "STATUS" not in text and "╭" not in text and "╰" not in text:
+                if style == "fg:#EAFBFF bold" or style == "fg:#A3FF12":
+                    has_beam = True
+                else:
+                    assert style.startswith("fg:#")
+                    color = style[3:]
+                    assert color in _IRIDESCENT_RAMP
+        assert has_beam, "Active state should render laser scanline beam or halo"
 
 
-def test_face_map_eye_coords_match_idle_keyframe() -> None:
-    """Eye coordinates in face_map.json must match the hand-authored idle keyframe.
-
-    The idle keyframe was authored by placing eye glyphs at the correct eye-socket
-    positions in the portrait.  The dynamic overlay must place glyphs at the same
-    positions so the eyes do not appear to jump between idle keyframe and
-    dynamically-rendered frames.
-    """
+def test_face_map_no_eyes_and_assets_match_mouth_keyframes() -> None:
+    """face_map.json has no eyes/eye_sockets, assets have no eye glyphs, and idle keyframe adds mouth."""
+    import json
     from pathlib import Path
 
     ASSET_ROOT = Path("src/antigona/cli_ui/portrait_assets")
-    import json
-
     face_map = json.loads((ASSET_ROOT / "face_map.json").read_text())
+    eye_glyphs = set("●◒⌒◉◐◑◖◗○")
 
     for profile_name in ("full", "large", "medium", "compact", "mini"):
+        assert "eyes" not in face_map[profile_name]
+        assert "eye_sockets" not in face_map[profile_name]
+
         idle_path = ASSET_ROOT / profile_name / "keyframes" / "idle.txt"
         base_path = ASSET_ROOT / profile_name / "base.txt"
         if not idle_path.exists():
             continue
 
-        idle_lines = idle_path.read_text().splitlines()
-        base_lines = base_path.read_text().splitlines()
+        idle_text = idle_path.read_text()
+        base_text = base_path.read_text()
 
-        # Find where idle keyframe differs from base — those are the eye positions.
-        keyframe_eyes: list[tuple[int, int]] = []
+        for g in eye_glyphs:
+            assert g not in idle_text, f"Found {g} in {profile_name}/keyframes/idle.txt"
+            assert g not in base_text, f"Found {g} in {profile_name}/base.txt"
+
+        idle_lines = idle_text.splitlines()
+        base_lines = base_text.splitlines()
+
+        # Find where idle keyframe differs from base — those are the mouth positions (···)
+        diff_positions: list[tuple[int, int]] = []
         for row_i, (idle_line, base_line) in enumerate(zip(idle_lines, base_lines, strict=False)):
             if idle_line != base_line:
-                for col_i, (ic, _) in enumerate(zip(idle_line, base_line, strict=False)):
-                    if ic in "●◐◑○◉◒⌒":
-                        keyframe_eyes.append((col_i, row_i))
+                for col_i, (ic, bc) in enumerate(zip(idle_line, base_line, strict=False)):
+                    if ic != bc:
+                        diff_positions.append((col_i, row_i))
+                        assert ic == "·"
 
-        fm_eyes = [(int(e[0]), int(e[1])) for e in face_map[profile_name]["eyes"]]
-        assert sorted(keyframe_eyes[:2]) == sorted(fm_eyes[:2]), (
-            f"{profile_name}: face_map eyes {fm_eyes} differ from keyframe eyes {keyframe_eyes}. "
-            "The dynamic eye overlay will not align with the portrait's eye sockets."
+        mx, my = face_map[profile_name]["mouth"]
+        expected_mouth = [(mx - 1, my), (mx, my), (mx + 1, my)]
+        assert diff_positions == expected_mouth, (
+            f"{profile_name}: diffs {diff_positions} do not match mouth {expected_mouth}"
         )
 
 

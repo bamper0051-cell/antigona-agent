@@ -2,261 +2,141 @@
   "full": {
     "cols": 76,
     "rows": 42,
-    "eyes": [
-      [
-        19,
-        17
-      ],
-      [
-        28,
-        17
-      ]
-    ],
-    "eye_sockets": {
-      "left": {
-        "center_x": 19,
-        "open_y": 17,
-        "min_x": 18,
-        "max_x": 20
-      },
-      "right": {
-        "center_x": 28,
-        "open_y": 17,
-        "min_x": 27,
-        "max_x": 29
-      }
-    },
     "brows": [
       [
         19,
-        16
+        19
       ],
       [
         28,
-        16
+        19
       ]
     ],
     "mouth": [
       30,
-      20
+      25
     ],
     "tear": [
       29,
-      18
+      21
     ],
     "face_protect": [
       10,
-      8,
+      11,
       39,
-      25
+      30
     ]
   },
   "large": {
     "cols": 62,
     "rows": 35,
-    "eyes": [
-      [
-        16,
-        14
-      ],
-      [
-        23,
-        14
-      ]
-    ],
-    "eye_sockets": {
-      "left": {
-        "center_x": 16,
-        "open_y": 14,
-        "min_x": 15,
-        "max_x": 17
-      },
-      "right": {
-        "center_x": 23,
-        "open_y": 14,
-        "min_x": 22,
-        "max_x": 24
-      }
-    },
     "brows": [
       [
         16,
-        13
+        16
       ],
       [
         23,
-        13
+        16
       ]
     ],
     "mouth": [
       25,
-      17
+      21
     ],
     "tear": [
       24,
-      15
+      18
     ],
     "face_protect": [
       7,
-      5,
+      8,
       34,
-      22
+      26
     ]
   },
   "medium": {
     "cols": 52,
     "rows": 29,
-    "eyes": [
-      [
-        13,
-        12
-      ],
-      [
-        19,
-        12
-      ]
-    ],
-    "eye_sockets": {
-      "left": {
-        "center_x": 13,
-        "open_y": 12,
-        "min_x": 12,
-        "max_x": 14
-      },
-      "right": {
-        "center_x": 19,
-        "open_y": 12,
-        "min_x": 18,
-        "max_x": 20
-      }
-    },
     "brows": [
       [
         13,
-        11
+        13
       ],
       [
         19,
-        11
+        13
       ]
     ],
     "mouth": [
       21,
-      15
+      17
     ],
     "tear": [
       20,
-      13
+      15
     ],
     "face_protect": [
       4,
-      3,
+      5,
       30,
-      20
+      22
     ]
   },
   "compact": {
     "cols": 44,
     "rows": 25,
-    "eyes": [
-      [
-        11,
-        10
-      ],
-      [
-        16,
-        10
-      ]
-    ],
-    "eye_sockets": {
-      "left": {
-        "center_x": 11,
-        "open_y": 10,
-        "min_x": 10,
-        "max_x": 12
-      },
-      "right": {
-        "center_x": 16,
-        "open_y": 10,
-        "min_x": 15,
-        "max_x": 17
-      }
-    },
     "brows": [
       [
         11,
-        9
+        11
       ],
       [
         16,
-        9
+        11
       ]
     ],
     "mouth": [
       18,
-      13
+      15
     ],
     "tear": [
       17,
-      11
+      13
     ],
     "face_protect": [
       2,
-      1,
+      3,
       27,
-      18
+      20
     ]
   },
   "mini": {
     "cols": 36,
     "rows": 20,
-    "eyes": [
-      [
-        9,
-        8
-      ],
-      [
-        13,
-        8
-      ]
-    ],
-    "eye_sockets": {
-      "left": {
-        "center_x": 9,
-        "open_y": 8,
-        "min_x": 8,
-        "max_x": 10
-      },
-      "right": {
-        "center_x": 13,
-        "open_y": 8,
-        "min_x": 12,
-        "max_x": 14
-      }
-    },
     "brows": [
       [
         9,
-        7
+        9
       ],
       [
         13,
-        7
+        9
       ]
     ],
     "mouth": [
       15,
-      11
+      12
     ],
     "tear": [
       14,
-      9
+      11
     ],
     "face_protect": [
       0,
-      0,
+      1,
       24,
-      16
+      17
     ]
   }
 }

@@ -55,7 +55,7 @@ import os
 import shutil
 import time
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Final
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.filters import Condition
@@ -228,6 +228,19 @@ _ROLE_COLORS: dict[str, str] = {
     "warning": AMBER,
     "info": MAGENTA,
 }
+
+#: Iridescent neon colour ramp (HSV-interpolated cyclic gradient along cold arc).
+#: Anchors: lime (#A3FF12) -> cyan (#22E1FF) -> blue (#7FA3FF) -> violet (#C88DFF) -> magenta (#FF82DA) -> violet -> blue -> cyan -> lime (#A3FF12).
+_IRIDESCENT_RAMP: Final[tuple[str, ...]] = (
+    "#A3FF12", "#60FF15", "#1EFF17", "#1AFF56", "#1DFF9A", "#1FFFDC",
+    "#22E1FF", "#40D3FF", "#54C7FF", "#63BDFF", "#6EB3FF", "#77ABFF",
+    "#7FA3FF", "#8E9FFF", "#999BFF", "#A498FF", "#AF95FF", "#BB91FF",
+    "#C88DFF", "#D689FF", "#E485FF", "#F381FF", "#FF7FFA", "#FF81EA",
+    "#FF82DA", "#FF81EA", "#FF7FFA", "#F381FF", "#E485FF", "#D689FF",
+    "#C88DFF", "#BB91FF", "#AF95FF", "#A498FF", "#999BFF", "#8E9FFF",
+    "#7FA3FF", "#77ABFF", "#6EB3FF", "#63BDFF", "#54C7FF", "#40D3FF",
+    "#22E1FF", "#1FFFDC", "#1DFF9A", "#1AFF56", "#1EFF17", "#60FF15",
+)
 
 #: Dark-plum backdrop for the ``/`` menu overlay and a violet-tinted
 #: scrollbar — replaces prompt_toolkit's built-in mid-grey defaults
@@ -891,35 +904,32 @@ class AntigonaLayout:
         left = max(0, (cols - profile.cols) // 2)
         indent = " " * left
 
-        # Holographic Vertical Cyber-Scanline (Replaces rainbow shimmer wave).
-        # Idle: Clean unified platinum silver with subtle breathing pulse.
-        # Active: Sleek laser scanline beam sweeping top-to-bottom across the face.
-        _COLOR_IDLE_BASE = "#E8E4DC"      # Platinum silver
-        _COLOR_IDLE_BREATHE = "#C0B8D0"   # Soft lavender silver (breathe pulse)
-        _COLOR_ACTIVE_BASE = "#A855F7"    # Brand Violet
-        _COLOR_SCAN_BEAM = "#FFFFFF"      # Bright scanline beam
-        _COLOR_SCAN_GLOW = "#38BDF8"      # Cyan halo around scanline
-
+        # Iridescent neon portrait coloring:
+        # Idle / Done: Calm diagonal wave drift across the lines (k = 2)
+        # Active: Faster diagonal wave (k = 4) + moving holographic laser scanline beam
         is_active = self.state.current_status not in {"idle", "done"}
+        total_rows = len(lines)
+        ramp_len = len(_IRIDESCENT_RAMP)
 
         fragments: StyleAndTextTuples = []
         if not is_active:
-            # Idle state: Subtle unified breathing pulse (no line-by-line rainbow shift)
-            breathe_phase = (self._portrait_phase // 4) % 2
-            base_color = _COLOR_IDLE_BREATHE if breathe_phase == 1 else _COLOR_IDLE_BASE
-            for line in lines:
-                fragments.append((f"fg:{base_color}", f"{indent}{line}\n"))
+            # Idle state: Calm diagonal iridescent color wave
+            k = 2
+            for line_idx, line in enumerate(lines):
+                color = _IRIDESCENT_RAMP[(self._portrait_phase * k + line_idx) % ramp_len]
+                fragments.append((f"fg:{color}", f"{indent}{line}\n"))
         else:
-            # Active state: Holographic vertical scanline sweep (moving laser beam)
-            total_rows = len(lines)
+            # Active state: Faster iridescent wave + running holographic laser beam
+            k = 4
             scan_row = (self._portrait_phase % total_rows) if total_rows > 0 else 0
             for line_idx, line in enumerate(lines):
                 if line_idx == scan_row:
-                    line_style = f"fg:{_COLOR_SCAN_BEAM} bold"
+                    line_style = "fg:#EAFBFF bold"
                 elif abs(line_idx - scan_row) == 1:
-                    line_style = f"fg:{_COLOR_SCAN_GLOW}"
+                    line_style = "fg:#A3FF12"
                 else:
-                    line_style = f"fg:{_COLOR_ACTIVE_BASE}"
+                    color = _IRIDESCENT_RAMP[(self._portrait_phase * k + line_idx) % ramp_len]
+                    line_style = f"fg:{color}"
                 fragments.append((line_style, f"{indent}{line}\n"))
 
         # Cybernetic Status Banner Box directly under Antigone's portrait
@@ -945,46 +955,6 @@ class AntigonaLayout:
             debug_line = "  ".join(f"{key}={value}" for key, value in debug.items())
             fragments.append((f"fg:{MUTED_GREY}", f"{b_indent}{debug_line}\n"))
         return fragments
-
-    def _portrait_eye_color(self) -> str:
-        """Slow pulsing eye accent for THINKING / WORKING states.
-
-        Returns a hex colour for the eye glyph overlay.  During active work,
-        the colour breathes through a dim-cyan → cyan → almost-white cycle
-        approximately every 1.5 seconds.  No new timer is used — the phase is
-        already advanced by the bounded refresh loop at 4 Hz.
-
-        Returns an empty string when no eye-specific colour should be applied
-        (the portrait will then use the single base portrait colour).
-        """
-        status = self.state.current_status
-        if status in {"sending", "planning"}:
-            # THINKING: slow dim-cyan → cyan pulse (period ≈ 1.5 s at 4 Hz = 6 ticks)
-            phase = self._portrait_phase % 6
-            _thinking_palette = (
-                "#4A7FA5",  # dim cyan-blue
-                "#5B9CBD",
-                "#72B9D4",
-                "#89CFEA",  # near-white cyan peak
-                "#72B9D4",
-                "#5B9CBD",
-            )
-            return _thinking_palette[phase]
-        if status in {"running", "tool_executing", "observing"}:
-            # WORKING: slightly warmer cyan → violet pulse
-            phase = self._portrait_phase % 8
-            _working_palette = (
-                "#56A3C7",  # cyan
-                "#7BBBD9",
-                "#A0D0E6",  # near-white
-                "#B8A0D9",  # start violet shift
-                "#9080C8",  # violet
-                "#7866B4",
-                "#6E5AAA",
-                "#5B4A9A",  # deep violet, back toward cyan next tick
-            )
-            return _working_palette[phase]
-        return ""
 
     def _create_portrait(self) -> Window:
         """Responsive living portrait between the 2-line header and history."""

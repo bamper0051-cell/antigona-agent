@@ -16,7 +16,7 @@ import pytest
 import antigona.cli_ui.layout as layout_module
 from antigona.cli_ui.layout import AntigonaLayout
 from antigona.cli_ui.models import ChatMessage, ChatMessageRole, ChatUIState
-from antigona.cli_ui.portrait import GAZE_CHARS, PortraitEngine
+from antigona.cli_ui.portrait import PortraitEngine
 from antigona.cli_ui.renderer import CliRenderer
 
 
@@ -186,17 +186,21 @@ def test_multiline_text_wrapping_preserves_all_lines() -> None:
 # ── Requirement 3: Living Portrait Alignment & Layers ────────────────────────
 
 def test_portrait_eye_anchors_aligned_in_apply_layers() -> None:
+    """Verifies that eyes are removed: face_map has no eyes/sockets, and no eye glyphs are rendered."""
     engine = PortraitEngine()
-    
+    eye_glyphs = set("●◒⌒◉◐◑◖◗○")
+
     # Test across profiles
     for profile_name in ("full", "large", "medium", "compact", "mini"):
         spec = engine.face_map[profile_name]
-        (ex1, ey1), (ex2, ey2) = spec["eyes"][0], spec["eyes"][1]
+        assert "eyes" not in spec
+        assert "eye_sockets" not in spec
 
         # Render with gaze=left
         rendered_left = engine.render(profile_name, gaze="left", glitch=False)
-        assert rendered_left[ey1][ex1] == GAZE_CHARS["left"]
-        assert rendered_left[ey2][ex2] == GAZE_CHARS["left"]
+        for line in rendered_left:
+            for g in eye_glyphs:
+                assert g not in line
 
         # Blinking is REMOVED: no gaze/expression combination may ever put the
         # old closed-lid glyph "─" on an eye anchor, and the `blink` keyword
@@ -206,8 +210,9 @@ def test_portrait_eye_anchors_aligned_in_apply_layers() -> None:
                 frame = engine.render(
                     profile_name, gaze=gaze, expression=expression, glitch=False
                 )
-                assert frame[ey1][ex1] != "─"
-                assert frame[ey2][ex2] != "─"
+                for line in frame:
+                    for g in eye_glyphs:
+                        assert g not in line
         with pytest.raises(TypeError):
             engine.render(profile_name, blink=True, glitch=False)  # type: ignore[call-arg]
 

@@ -169,3 +169,37 @@ def test_sanitize_delivery_error_never_leaks_endpoint_or_token() -> None:
     assert "api.telegram.org" not in code
     assert "123456789:AAFakeTokenValueXYZ" not in code
     assert code == "delivery.execution_error"
+
+
+def test_telegram_progress_recovers_persisted_message_after_worker_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = db(tmp_path)
+    task_id = make_task(database)
+    with database.session_factory() as session:
+        from sqlalchemy import delete
+
+        session.execute(delete(DeliveryOutbox))
+        session.add(outbox(task_id, "progress-1"))
+        session.commit()
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def post(self: TelegramAdapter, method: str, payload: dict[str, Any], key: str) -> dict[str, Any]:
+        calls.append((method, payload))
+        if method == "sendMessage":
+            return {"ok": True, "result": {"message_id": 9001}}
+        return {"ok": True, "result": {"message_id": payload["message_id"]}}
+
+    monkeypatch.setattr(TelegramAdapter, "_post", post)
+    first = TelegramAdapter("TOKEN", "CHAT")
+    assert DeliveryWorker(database.session_factory(), first).dispatch_one()
+
+    with database.session_factory() as session:
+        session.add(outbox(task_id, "progress-2"))
+        session.commit()
+
+    second = TelegramAdapter("TOKEN", "CHAT")
+    assert DeliveryWorker(database.session_factory(), second).dispatch_one()
+    assert [method for method, _ in calls] == ["sendMessage", "editMessageText"]
+    assert calls[1][1]["message_id"] == 9001

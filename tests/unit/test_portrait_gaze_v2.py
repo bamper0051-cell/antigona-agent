@@ -239,10 +239,11 @@ def test_working_intensity_increases_the_glitch_budget() -> None:
     assert sum(_glitch_symbol_counts(busy, cols)) > sum(_glitch_symbol_counts(calm, cols))
 
 
-# ── 5. Input-length micro-reaction ───────────────────────────────────────────
+# ── 5. Input-length micro-reaction & eye-removal verification ─────────────────
 
 
-def test_input_focus_changes_only_the_two_eye_cells() -> None:
+def test_input_focus_changes_no_cells_since_eyes_removed() -> None:
+    """Eye mechanics were removed: input_focus produces byte-for-byte identical output."""
     engine = PortraitEngine()
     for profile in engine.profiles.values():
         calm = engine.render(profile.name, gaze="center", glitch=False)
@@ -250,18 +251,17 @@ def test_input_focus_changes_only_the_two_eye_cells() -> None:
             profile.name, gaze="center", glitch=False, input_focus=True
         )
         changed = _diff_cells(calm, focused)
-        assert 1 <= len(changed) <= 2, f"{profile.name}: {changed}"
+        assert len(changed) == 0, f"{profile.name}: {changed}"
+        assert calm == focused
 
 
-def test_input_focus_is_never_suppressed_by_a_blink_frame() -> None:
-    """Blinking was removed, so nothing can override the concentrated eye glyphs:
-    input_focus must always land on the two eye cells."""
+def test_render_identical_across_all_gaze_and_input_focus() -> None:
+    """PortraitEngine.render() for all values of gaze and input_focus gives byte-for-byte
+    identical result (proving eye mechanics are gone)."""
     engine = PortraitEngine()
     for profile in engine.profiles.values():
-        calm = engine.render(profile.name, gaze="center", glitch=False)
-        focused = engine.render(
-            profile.name, gaze="center", glitch=False, input_focus=True
-        )
-        changed = _diff_cells(calm, focused)
-        assert 1 <= len(changed) <= 2, f"{profile.name}: {changed}"
-        assert calm != focused
+        baseline = engine.render(profile.name, gaze="center", glitch=False, input_focus=False)
+        for gaze in GAZE_ORDER:
+            for focus in (False, True):
+                frame = engine.render(profile.name, gaze=gaze, glitch=False, input_focus=focus)
+                assert frame == baseline, f"{profile.name} differed for gaze={gaze}, input_focus={focus}"
